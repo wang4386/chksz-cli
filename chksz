@@ -700,6 +700,100 @@ install_shortcut() {
   fi
 }
 
+# ---------------- 卸载 ----------------
+# 安全卸载: 逐项确认, 危险操作默认否; 歌曲文件默认保留
+uninstall() {
+  local yn
+  hr
+  echo "卸载 chksz (安全模式, 每一步都会询问)"
+  echo "将执行:"
+  echo "  1. 删除快捷命令: $HOME/.local/bin/chksz"
+  echo "  2. 删除配置目录: $CONFIG_DIR (含 API Key)"
+  echo "  3. 清理 ~/.bashrc 中的 PATH 设置"
+  echo "  4. 逐个询问是否移除依赖 (curl/jq/ffmpeg/mutagen, 默认不移除)"
+  echo "  5. 询问是否保留已下载歌曲 (默认保留)"
+  read -rp "确认卸载? [y/N]: " yn < /dev/tty
+  [[ "$yn" =~ ^[yY]$ ]] || { echo "已取消"; return 0; }
+
+  # 1. 快捷命令 (脚本本身即使正在运行, 删除文件也是安全的)
+  if [ -f "$HOME/.local/bin/chksz" ]; then
+    rm -f "$HOME/.local/bin/chksz" && ok "已删除快捷命令"
+  else
+    info "未发现快捷命令, 跳过"
+  fi
+
+  # 2. 配置目录 (含 API Key, 必须清除)
+  if [ -d "$CONFIG_DIR" ]; then
+    rm -rf "$CONFIG_DIR" && ok "已删除配置目录 (API Key 已清除)"
+  fi
+
+  # 3. 清理 ~/.bashrc 中安装时写入的 PATH 设置 (只删我们自己加的那两行)
+  if [ -f "$HOME/.bashrc" ] && grep -q '# chksz 快捷命令' "$HOME/.bashrc"; then
+    awk '
+      /^# chksz 快捷命令$/ { skip=1; next }
+      skip==1 && /^export PATH="\$HOME\/.local\/bin:\$PATH"$/ { skip=0; next }
+      { skip=0; print }
+    ' "$HOME/.bashrc" > "$HOME/.bashrc.tmp" \
+      && mv -f "$HOME/.bashrc.tmp" "$HOME/.bashrc" \
+      && ok "已清理 ~/.bashrc (重新登录后 PATH 恢复)"
+  fi
+
+  # 4. 依赖: 逐个询问, 默认不移除
+  local pm sudo_cmd=""
+  pm="$(detect_pm)"
+  [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
+  local item cmd pkg
+  for item in "curl:curl" "jq:jq" "ffmpeg:ffmpeg"; do
+    cmd="${item%%:*}"; pkg="$(pkg_name "$cmd")"
+    if command -v "$cmd" >/dev/null 2>&1; then
+      read -rp "是否移除 $cmd? (如被其他程序使用请选否) [y/N]: " yn < /dev/tty
+      if [[ "$yn" =~ ^[yY]$ ]]; then
+        case "$pm" in
+          apt-get) $sudo_cmd apt-get remove -y "$pkg" ;;
+          dnf|yum) $sudo_cmd "$pm" remove -y "$pkg" ;;
+          apk)     $sudo_cmd apk del "$pkg" ;;
+          pacman)  $sudo_cmd pacman -Rs --noconfirm "$pkg" ;;
+          pkg)     pkg uninstall -y "$pkg" ;;
+          brew)    brew uninstall "$pkg" ;;
+          *) warn "未识别包管理器, 请手动移除 $pkg"; continue ;;
+        esac && ok "已移除 $cmd" || warn "$cmd 移除失败"
+      fi
+    fi
+  done
+  if command -v python3 >/dev/null 2>&1 && python3 -c "import mutagen" 2>/dev/null; then
+    read -rp "是否移除 mutagen? [y/N]: " yn < /dev/tty
+    if [[ "$yn" =~ ^[yY]$ ]]; then
+      if python3 -m pip uninstall -y -q mutagen 2>/dev/null || \
+         python3 -m pip uninstall -y -q --break-system-packages mutagen 2>/dev/null; then
+        ok "已移除 mutagen"
+      else
+        warn "mutagen 移除失败"
+      fi
+    fi
+  fi
+
+  # 5. 已下载歌曲: 默认保留
+  if [ -d "$SAVE_DIR" ]; then
+    local yn3
+    read -rp "是否保留已下载的歌曲文件? ($SAVE_DIR) [Y/n]: " yn3 < /dev/tty
+    if [[ "$yn3" =~ ^[nN]$ ]]; then
+      case "$SAVE_DIR" in
+        ""|"/"|"$HOME")
+          err "拒绝删除关键目录 ($SAVE_DIR), 请手动处理" ;;
+        *)
+          rm -rf "$SAVE_DIR" && ok "已删除歌曲文件" ;;
+      esac
+    else
+      ok "已保留歌曲文件: $SAVE_DIR"
+    fi
+  else
+    info "下载目录不存在, 跳过"
+  fi
+
+  echo
+  ok "卸载完成"
+}
+
 # ---------------- 主菜单 ----------------
 banner() {
   printf "${C_BOLD}${C_CYAN}"
@@ -726,6 +820,7 @@ main_menu() {
     echo "4) 设置 (Key/目录/音质)"
     echo "5) 安装依赖"
     echo "6) 安装 chksz 快捷命令"
+    echo "7) 卸载 chksz"
     echo "0) 退出"
     read -rp "请选择: " c < /dev/tty
     case "$c" in
@@ -735,6 +830,7 @@ main_menu() {
       4) settings_menu ;;
       5) install_deps ;;
       6) install_shortcut ;;
+      7) uninstall ;;
       0) echo "再见!"; exit 0 ;;
       *) warn "无效选择" ;;
     esac
@@ -756,6 +852,7 @@ chksz v$VERSION - ChKSz API 交互式音乐下载 (网易云)
   chksz quality [音质]           设置首选音质: jymaster|hires|lossless|exhigh|standard
   chksz deps                     安装依赖 (curl/jq/ffmpeg)
   chksz install                  安装 chksz 快捷命令到 ~/.local/bin
+  chksz uninstall                安全卸载 (删脚本/配置/快捷命令, 逐项确认)
   chksz config                   查看当前配置
   chksz help                     显示本帮助
 
@@ -778,6 +875,7 @@ main() {
     quality|q)      shift; set_quality "${1:-}" ;;
     deps)           install_deps ;;
     install)        install_shortcut ;;
+    uninstall)      uninstall ;;
     config)         show_config ;;
     help|--help|-h) usage ;;
     version|--version|-v) echo "chksz v$VERSION" ;;

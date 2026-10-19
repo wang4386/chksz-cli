@@ -33,6 +33,7 @@ chksz quality <音质>        # 设置首选音质：jymaster|hires|lossless|exh
 chksz config                # 查看当前配置（Key 打码显示）
 chksz deps                  # 安装依赖
 chksz install               # 安装 chksz 快捷命令
+chksz uninstall             # 安全卸载：删脚本/配置/快捷命令，依赖逐个询问（默认不删），歌曲默认保留
 chksz help                  # 帮助
 ```
 

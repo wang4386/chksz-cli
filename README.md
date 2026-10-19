@@ -82,6 +82,8 @@ chksz key <apikey>             设置 API Key
 chksz dir ~/Music              设置下载目录
 chksz quality lossless         设置首选音质
 chksz deps / install / config  依赖安装 / 安装快捷命令 / 查看配置
+chksz uninstall              安全卸载：删除脚本、配置、快捷命令，
+                             依赖逐个询问（默认不删），歌曲文件默认保留
 ```
 
 ## 配置文件
