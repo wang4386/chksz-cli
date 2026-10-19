@@ -1,0 +1,767 @@
+#!/usr/bin/env bash
+#
+# chksz — ChKSz API 交互式音乐下载脚本 (网易云音乐)
+#
+# 根据 https://github.com/ChKSz/CDown 重构的纯 Shell 交互式版本，
+# 适配新版 API https://api.chksz.com (旧域名 api.chksz.top 已弃用，
+# 新版全部 163_* 接口均需 apikey 参数)。
+#
+# 功能:
+#   1) 交互式搜索歌曲并下载
+#   2) 歌单 ID/链接解析并批量下载
+#   3) 下载位置 / 首选音质 / API Key 等设置，持久化保存
+#   4) 依赖一键安装 (curl / jq / ffmpeg 可选)
+#   5) 音质按 jymaster > hires > lossless > exhigh > standard 依次回退
+#   6) `chksz install` 安装 chksz 快捷命令
+#
+# 用法: chksz [search "关键词"|playlist <ID或链接>|song <歌曲ID>|key <apikey>|...]
+#       直接运行 chksz 进入交互菜单。
+
+set -u
+
+VERSION="1.0.0"
+API_BASE="https://api.chksz.com/api"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/chksz"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+# 音质等级: 从高到低
+LEVELS=(jymaster hires lossless exhigh standard)
+declare -A LEVEL_NAME=(
+  [jymaster]="超清母带"
+  [hires]="Hi-Res"
+  [lossless]="无损"
+  [exhigh]="极高"
+  [standard]="标准"
+)
+declare -A LEVEL_EXT=(
+  [jymaster]="flac"
+  [hires]="flac"
+  [lossless]="flac"
+  [exhigh]="mp3"
+  [standard]="mp3"
+)
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")"
+
+# ---------------- 基础输出 ----------------
+if [ -t 1 ]; then
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'; C_CYAN=$'\033[36m'; C_BOLD=$'\033[1m'; C_RESET=$'\033[0m'
+else
+  C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""; C_BOLD=""; C_RESET=""
+fi
+
+info()  { printf "%s[*]%s %s\n" "$C_BLUE" "$C_RESET" "$*"; }
+ok()    { printf "%s[✓]%s %s\n" "$C_GREEN" "$C_RESET" "$*"; }
+warn()  { printf "%s[!]%s %s\n" "$C_YELLOW" "$C_RESET" "$*"; }
+err()   { printf "%s[✗]%s %s\n" "$C_RED" "$C_RESET" "$*" >&2; }
+die()   { err "$*"; exit 1; }
+hr()    { printf '%*s\n' "${COLUMNS:-60}" '' | tr ' ' '-'; }
+
+pause() { read -rp "按回车继续..." _ < /dev/tty; }
+
+# ---------------- 配置持久化 ----------------
+# 默认值
+APIKEY=""
+SAVE_DIR="$HOME/Music/chksz"
+QUALITY="jymaster"
+SAVE_LRC=1
+EMBED_META=1
+
+load_config() {
+  if [ -f "$CONFIG_FILE" ]; then
+    # 仅读取白名单键，避免执行任意内容
+    while IFS='=' read -r k v; do
+      case "$k" in
+        APIKEY|SAVE_DIR|QUALITY|SAVE_LRC|EMBED_META)
+          # 去掉首尾引号
+          v="${v%\"}"; v="${v#\"}"
+          printf -v "$k" '%s' "$v"
+          ;;
+      esac
+    done < "$CONFIG_FILE"
+  fi
+  [ -z "$QUALITY" ] && QUALITY="jymaster"
+  [ -z "$SAVE_DIR" ] && SAVE_DIR="$HOME/Music/chksz"
+}
+
+save_config() {
+  mkdir -p "$CONFIG_DIR"
+  {
+    printf 'APIKEY="%s"\n' "$APIKEY"
+    printf 'SAVE_DIR="%s"\n' "$SAVE_DIR"
+    printf 'QUALITY="%s"\n' "$QUALITY"
+    printf 'SAVE_LRC="%s"\n' "$SAVE_LRC"
+    printf 'EMBED_META="%s"\n' "$EMBED_META"
+  } > "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+  ok "配置已保存到 $CONFIG_FILE"
+}
+
+show_config() {
+  hr
+  printf "API Key     : %s\n" "$([ -n "$APIKEY" ] && echo "${APIKEY:0:6}******(已设置)" || echo "${C_RED}未设置${C_RESET}")"
+  printf "下载目录    : %s\n" "$SAVE_DIR"
+  printf "首选音质    : %s (%s)\n" "$QUALITY" "${LEVEL_NAME[$QUALITY]:-?}"
+  printf "回退顺序    : %s\n" "$(fallback_levels | tr '\n' ' ')"
+  printf "保存歌词    : %s\n" "$([ "$SAVE_LRC" = 1 ] && echo "是" || echo "否")"
+  printf "元数据嵌入  : %s\n" "$([ "$EMBED_META" = 1 ] && echo "是 (封面/歌词/标签, 需 mutagen 或 ffmpeg)" || echo "否")"
+  hr
+}
+
+# 从首选音质开始的回退顺序 (每行一个)
+fallback_levels() {
+  local start=0 i
+  for i in "${!LEVELS[@]}"; do
+    [ "${LEVELS[$i]}" = "$QUALITY" ] && { start=$i; break; }
+  done
+  for ((i = start; i < ${#LEVELS[@]}; i++)); do
+    echo "${LEVELS[$i]}"
+  done
+}
+
+require_apikey() {
+  if [ -z "$APIKEY" ]; then
+    err "尚未设置 API Key。请先在菜单 4) 设置，或执行: chksz key <你的apikey>"
+    err "获取地址: https://api.chksz.com (登录后查看个人密钥)"
+    return 1
+  fi
+}
+
+# ---------------- API 调用层 ----------------
+# api_get <endpoint> ["k=v" ...]  -> 输出响应 body
+api_get() {
+  local endpoint="$1"; shift
+  local args=(--data-urlencode "apikey=$APIKEY")
+  local p
+  for p in "$@"; do
+    args+=(--data-urlencode "$p")
+  done
+  curl -sS --max-time 30 --retry 2 --retry-delay 1 -G \
+    "$API_BASE/$endpoint" "${args[@]}"
+}
+
+# 检查响应: $1=body ; 401 时提示 key 问题并返回 1
+api_code() { jq -r '.code // 0' <<<"$1" 2>/dev/null || echo 0; }
+
+check_api_resp() {
+  local body="$1" action="$2"
+  local code
+  code=$(api_code "$body")
+  if [ "$code" = "401" ]; then
+    err "API Key 无效或缺失 ($(jq -r '.msg // ""' <<<"$body"))"
+    err "请检查设置中的 API Key: chksz key <apikey>"
+    return 1
+  fi
+  if [ "$code" != "200" ]; then
+    err "${action}失败: code=$code msg=$(jq -r '.msg // ""' <<<"$body")"
+    return 1
+  fi
+  return 0
+}
+
+# ---------------- 工具函数 ----------------
+sanitize() {
+  # 文件名清洗: 非法字符 -> 下划线, 限长
+  local s="$1"
+  s="$(printf '%s' "$s" | tr '/\\:*?"<>|' '_' | sed 's/^[ .]*//;s/[ .]*$//')"
+  [ ${#s} -gt 100 ] && s="${s:0:100}"
+  [ -z "$s" ] && s="unknown"
+  printf '%s' "$s"
+}
+
+fmt_duration() {
+  # 毫秒 -> m:ss
+  local ms="${1:-0}" s
+  s=$((ms / 1000))
+  printf '%d:%02d' $((s / 60)) $((s % 60))
+}
+
+unique_path() {
+  # $1=目录 $2=文件名(不含扩展) $3=扩展 -> 输出不冲突的完整路径
+  local dir="$1" base="$2" ext="$3" p n=1
+  p="$dir/$base.$ext"
+  while [ -e "$p" ]; do
+    n=$((n + 1)); p="$dir/$base ($n).$ext"
+  done
+  printf '%s' "$p"
+}
+
+# 解析 "1 3 5-8" / "all" 为序号列表 (每行一个, 1-based), $1=输入 $2=上限
+expand_selection() {
+  local input="$1" max="$2" tok a b i
+  input="$(tr ',' ' ' <<<"$input")"
+  for tok in $input; do
+    if [ "$tok" = "all" ]; then
+      seq 1 "$max"; return 0
+    elif [[ "$tok" =~ ^[0-9]+-[0-9]+$ ]]; then
+      a="${tok%-*}"; b="${tok#*-}"
+      [ "$a" -gt "$b" ] && { local t=$a; a=$b; b=$t; }
+      [ "$a" -lt 1 ] && a=1; [ "$b" -gt "$max" ] && b=$max
+      seq "$a" "$b"
+    elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+      [ "$tok" -ge 1 ] && [ "$tok" -le "$max" ] && echo "$tok"
+    fi
+  done | sort -un
+}
+
+# ---------------- 核心: 单曲解析 + 下载 ----------------
+# download_song <id> <name> <artists> <album> <picUrl>
+download_song() {
+  local id="$1" name="$2" artists="$3" album="$4" pic="$5"
+  local lvl body url real_level size br
+  local ext base target tmpfile ok_level=""
+
+  info "解析: $artists - $name"
+  while read -r lvl; do
+    body="$(api_get 163_music "id=$id" "level=$lvl" "type=json" 2>/dev/null)"
+    [ -z "$body" ] && continue
+    if [ "$(api_code "$body")" = "401" ]; then
+      err "API Key 无效, 停止下载"; return 2
+    fi
+    url="$(jq -r '.data.url // empty' <<<"$body" 2>/dev/null)"
+    if [ -n "$url" ]; then
+      ok_level="$lvl"
+      real_level="$(jq -r '.data.level // empty' <<<"$body")"
+      size="$(jq -r '.data.size // 0' <<<"$body")"
+      br="$(jq -r '.data.br // 0' <<<"$body")"
+      break
+    fi
+  done < <(fallback_levels)
+
+  if [ -z "$ok_level" ]; then
+    err "  全部音质解析失败 (可能版权限制/无可播放源)"
+    return 1
+  fi
+  if [ "$real_level" != "$ok_level" ] && [ -n "$real_level" ]; then
+    warn "  请求 $ok_level(${LEVEL_NAME[$ok_level]}), 实际返回 $real_level"
+  else
+    ok "  音质: $ok_level (${LEVEL_NAME[$ok_level]})"
+  fi
+
+  ext="${LEVEL_EXT[$ok_level]}"
+  mkdir -p "$SAVE_DIR"
+  base="$(sanitize "$artists - $name")"
+  target="$(unique_path "$SAVE_DIR" "$base" "$ext")"
+  tmpfile="$target.downloading"
+
+  info "  下载 -> $(basename "$target")"
+  if ! curl -fSL --retry 3 --retry-delay 2 -C - --progress-bar \
+       -o "$tmpfile" "$url" --max-time 0; then
+    warn "  断点续传失败, 尝试重新下载..."
+    rm -f "$tmpfile"
+    curl -fSL --retry 3 --retry-delay 2 --progress-bar \
+      -o "$tmpfile" "$url" --max-time 0 || {
+        err "  下载失败"; rm -f "$tmpfile"; return 1
+      }
+  fi
+  mv -f "$tmpfile" "$target"
+  ok "  已保存: $target"
+
+  # 歌词: 落盘 .lrc + 提取纯文本用于嵌入文件
+  local lrc_plain=""
+  {
+    local lrc_body lrc
+    lrc_body="$(api_get 163_lyric "id=$id" 2>/dev/null)"
+    lrc="$(jq -r '.data.lrc // empty' <<<"$lrc_body" 2>/dev/null)"
+    if [ -n "$lrc" ] && [ "$lrc" != "null" ]; then
+      if [ "$SAVE_LRC" = 1 ]; then
+        printf '%s\n' "$lrc" > "${target%.*}.lrc"
+        ok "  歌词已保存"
+      fi
+      # 去时间轴, 留纯文本 (同 CDown 的 parse_lrc_to_uslt)
+      lrc_plain="$(sed -e 's/^\[[^]]*\] *//' <<<"$lrc" | sed '/^[[:space:]]*$/d')"
+    fi
+  }
+
+  # 元数据嵌入: 封面 + 标题/歌手/专辑 + 歌词 (播放器无需联网刮削)
+  if [ "$EMBED_META" = 1 ]; then
+    embed_metadata "$target" "$pic" "$lrc_plain" "$name" "$artists" "$album"
+  fi
+  return 0
+}
+
+# embed_metadata <audio> <picUrl> <lyrics_plain> <title> <artist> <album>
+# 优先 python3+mutagen (写入标准 USLT/LYRICS 歌词帧, 同原版 CDown),
+# 回退 ffmpeg (封面+基础标签; 歌词只能进 TXXX, 部分播放器不识别)。
+embed_metadata() {
+  local audio="$1" pic="$2" lyrics="$3" title="$4" artist="$5" album="$6"
+  local ext="${audio##*.}" cover_tmp=""
+  if [ -n "$pic" ] && [ "$pic" != "null" ]; then
+    cover_tmp="$(mktemp --suffix=.jpg)"
+    curl -fsSL --max-time 20 -o "$cover_tmp" "$pic" 2>/dev/null || cover_tmp=""
+  fi
+
+  if command -v python3 >/dev/null 2>&1 && python3 -c "import mutagen" 2>/dev/null; then
+    if python3 - "$audio" "$cover_tmp" "$lyrics" "$title" "$artist" "$album" <<'PYEOF' 2>/dev/null; then
+import sys
+audio, cover, lyrics, title, artist, album = sys.argv[1:7]
+cover_data = None
+if cover:
+    with open(cover, 'rb') as f:
+        cover_data = f.read()
+if audio.lower().endswith('.mp3'):
+    from mutagen.mp3 import MP3
+    from mutagen.id3 import ID3, USLT, APIC, TIT2, TPE1, TALB
+    a = MP3(audio, ID3=ID3)
+    if a.tags is None:
+        a.add_tags()
+    t = a.tags
+    for key in [k for k in list(t.keys()) if k.startswith('USLT') or k.startswith('APIC')]:
+        del t[key]
+    t.add(TIT2(encoding=3, text=title))
+    t.add(TPE1(encoding=3, text=artist))
+    t.add(TALB(encoding=3, text=album))
+    if lyrics:
+        t.add(USLT(encoding=3, lang='eng', desc='', text=lyrics))
+    if cover_data:
+        t.add(APIC(encoding=3, mime='image/jpeg', type=3, desc='', data=cover_data))
+    a.save()
+elif audio.lower().endswith('.flac'):
+    from mutagen.flac import FLAC, Picture
+    a = FLAC(audio)
+    a['title'] = title
+    a['artist'] = artist
+    a['album'] = album
+    if lyrics:
+        a['lyrics'] = lyrics
+    if cover_data:
+        pic = Picture()
+        pic.data = cover_data
+        pic.mime = 'image/jpeg'
+        pic.type = 3
+        a.clear_pictures()
+        a.add_picture(pic)
+    a.save()
+print('embed-ok')
+PYEOF
+      ok "  元数据已嵌入 (封面/歌词/标签)"
+      rm -f "$cover_tmp"
+      return 0
+    fi
+    warn "  mutagen 嵌入失败, 尝试 ffmpeg"
+  fi
+
+  if [ -n "$cover_tmp" ]; then
+    if command -v ffmpeg >/dev/null 2>&1; then
+      local tagged="${audio}.tagged.${ext}"
+      if ffmpeg -y -loglevel error -i "$audio" -i "$cover_tmp" \
+           -map 0:a -map 1:v -c:a copy -c:v mjpeg \
+           -disposition:v attached_pic \
+           -metadata title="$title" -metadata artist="$artist" \
+           -metadata album="$album" "$tagged" 2>/dev/null; then
+        mv -f "$tagged" "$audio"
+        ok "  封面/标签已嵌入 (ffmpeg; 歌词未入标准帧, 建议安装 mutagen)"
+      else
+        rm -f "$tagged"
+        warn "  ffmpeg 嵌入失败"
+      fi
+    else
+      warn "  未安装 ffmpeg/mutagen, 跳过元数据嵌入 (菜单 5 可安装)"
+    fi
+  elif [ -z "$cover_tmp" ] && [ -n "$lyrics" ]; then
+    warn "  无封面且无嵌入工具, 跳过元数据嵌入"
+  fi
+  rm -f "$cover_tmp"
+  return 0
+}
+
+# ---------------- 搜索下载 ----------------
+do_search() {
+  local kw="$1" body code count i
+  require_apikey || return 1
+  if [ -z "$kw" ]; then
+    read -rp "搜索关键词: " kw < /dev/tty
+  fi
+  [ -z "$kw" ] && { err "关键词为空"; return 1; }
+
+  info "搜索: $kw ..."
+  body="$(api_get 163_search "keyword=$kw" "limit=20" "offset=0")"
+  [ -z "$body" ] && { err "搜索接口无响应, 稍后重试"; return 1; }
+  check_api_resp "$body" "搜索" || return 1
+
+  count="$(jq '.data.songs | length' <<<"$body")"
+  [ "$count" = "0" ] && { warn "没有搜到结果"; return 1; }
+
+  hr
+  printf "%-4s %-40s %s\n" "序号" "歌曲" "时长"
+  hr
+  for ((i = 0; i < count; i++)); do
+    local nm ar al du
+    nm="$(jq -r ".data.songs[$i].name" <<<"$body")"
+    ar="$(jq -r ".data.songs[$i].artists" <<<"$body")"
+    al="$(jq -r ".data.songs[$i].album" <<<"$body")"
+    du="$(jq -r ".data.songs[$i].duration" <<<"$body")"
+    printf "%-4d %-40.40s %s - %s [%s]\n" \
+      $((i + 1)) "$nm" "$ar" "$al" "$(fmt_duration "$du")"
+  done
+  hr
+
+  local sel ids n=0
+  read -rp "输入序号下载 (如 1 3 5-8, all=全部, q=返回): " sel < /dev/tty
+  [ "$sel" = "q" ] && return 0
+  mapfile -t ids < <(expand_selection "$sel" "$count")
+  [ ${#ids[@]} = "0" ] && { warn "未选择有效序号"; return 1; }
+
+  local idx sid nm ar al pic okc=0 failc=0
+  for idx in "${ids[@]}"; do
+    i=$((idx - 1))
+    sid="$(jq -r ".data.songs[$i].id" <<<"$body")"
+    nm="$(jq -r ".data.songs[$i].name" <<<"$body")"
+    ar="$(jq -r ".data.songs[$i].artists" <<<"$body")"
+    al="$(jq -r ".data.songs[$i].album" <<<"$body")"
+    pic="$(jq -r ".data.songs[$i].picUrl // empty" <<<"$body")"
+    if download_song "$sid" "$nm" "$ar" "$al" "$pic"; then
+      okc=$((okc + 1))
+    else
+      failc=$((failc + 1))
+    fi
+    n=$((n + 1))
+    echo
+  done
+  ok "完成: 成功 $okc 首, 失败 $failc 首"
+}
+
+# ---------------- 歌单解析下载 ----------------
+extract_playlist_id() {
+  local in="$1"
+  if [[ "$in" =~ ^[0-9]+$ ]]; then
+    echo "$in"
+  elif [[ "$in" =~ [\?\&]id=([0-9]+) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    grep -oE '[0-9]{4,}' <<<"$in" | head -1
+  fi
+}
+
+do_playlist() {
+  local raw="$1" pid body code name creator tcount i
+  require_apikey || return 1
+  if [ -z "$raw" ]; then
+    read -rp "歌单 ID 或链接: " raw < /dev/tty
+  fi
+  pid="$(extract_playlist_id "$raw")"
+  [ -z "$pid" ] && { err "无法识别歌单 ID"; return 1; }
+
+  info "解析歌单 $pid ..."
+  body="$(api_get 163_playlist "id=$pid")"
+  [ -z "$body" ] && { err "歌单接口无响应, 稍后重试"; return 1; }
+  check_api_resp "$body" "歌单解析" || return 1
+
+  name="$(jq -r '.data.name // "未知歌单"' <<<"$body")"
+  creator="$(jq -r '.data.creator.nickname // ""' <<<"$body")"
+  tcount="$(jq '.data.tracks | length' <<<"$body")"
+  [ "$tcount" = "0" ] && { warn "歌单为空"; return 1; }
+
+  hr
+  printf "歌单: %s\n创建者: %s\n歌曲数: %s\n" "$name" "$creator" "$tcount"
+  hr
+  local show=$((tcount < 15 ? tcount : 15))
+  for ((i = 0; i < show; i++)); do
+    local nm ar
+    nm="$(jq -r ".data.tracks[$i].name" <<<"$body")"
+    ar="$(jq -r '[.data.tracks['$i'].ar[].name] | join("/")' <<<"$body")"
+    printf "%-4d %s - %s\n" $((i + 1)) "$nm" "$ar"
+  done
+  [ "$tcount" -gt "$show" ] && echo "... 等共 $tcount 首"
+  hr
+
+  local sel
+  read -rp "下载全部(all)/输入序号(如 1 3 5-8)/q返回: " sel < /dev/tty
+  [ "$sel" = "q" ] && return 0
+  [ -z "$sel" ] && sel="all"
+
+  local idx sid nm ar al pic okc=0 failc=0 n=0
+  while read -r idx; do
+    i=$((idx - 1))
+    sid="$(jq -r ".data.tracks[$i].id" <<<"$body")"
+    nm="$(jq -r ".data.tracks[$i].name" <<<"$body")"
+    ar="$(jq -r '[.data.tracks['$i'].ar[].name] | join("/")' <<<"$body")"
+    al="$(jq -r ".data.tracks[$i].al.name // empty" <<<"$body")"
+    pic="$(jq -r ".data.tracks[$i].al.picUrl // empty" <<<"$body")"
+    printf "${C_BOLD}[$((n+1))]%s${C_RESET}\n" ""
+    if download_song "$sid" "$nm" "$ar" "$al" "$pic"; then
+      okc=$((okc + 1))
+    else
+      failc=$((failc + 1))
+    fi
+    n=$((n + 1)); echo
+  done < <(expand_selection "$sel" "$tcount")
+  ok "歌单下载完成: 成功 $okc 首, 失败 $failc 首"
+}
+
+# ---------------- 单曲 ID 直接下载 ----------------
+do_song() {
+  local sid="$1" body nm ar al pic
+  require_apikey || return 1
+  [ -z "$sid" ] && read -rp "歌曲 ID: " sid < /dev/tty
+  [[ "$sid" =~ ^[0-9]+$ ]] || { err "歌曲 ID 应为数字"; return 1; }
+
+  # 先用 lyric 接口顺手拿到歌曲名/歌手信息做文件名 (失败则用 ID)
+  body="$(api_get 163_lyric "id=$sid" 2>/dev/null)"
+  nm=""; ar=""; al=""; pic=""
+  download_song "$sid" "${nm:-$sid}" "${ar:-unknown}" "$al" "$pic"
+}
+
+# ---------------- 设置 ----------------
+set_apikey() {
+  local k="$1" body
+  if [ -z "$k" ]; then
+    echo "获取地址: https://api.chksz.com (登录后查看个人密钥)"
+    read -rsp "请输入 API Key: " k < /dev/tty; echo
+  fi
+  [ -z "$k" ] && { err "Key 为空, 未保存"; return 1; }
+  APIKEY="$k"
+  info "校验 Key 有效性..."
+  body="$(api_get 163_lyric "id=0" 2>/dev/null)"
+  if [ "$(api_code "$body")" = "401" ]; then
+    err "Key 无效 (401), 未保存"
+    APIKEY=""; return 1
+  fi
+  save_config
+  ok "API Key 已保存并通过校验"
+}
+
+set_savedir() {
+  local d="$1"
+  [ -z "$d" ] && read -rp "下载目录 (当前: $SAVE_DIR): " d < /dev/tty
+  [ -z "$d" ] && return 0
+  # 支持 ~ 展开
+  d="${d/#\~/$HOME}"
+  mkdir -p "$d" || { err "目录创建失败"; return 1; }
+  SAVE_DIR="$(readlink -f "$d")"
+  save_config
+}
+
+set_quality() {
+  local q="$1" i=1
+  if [ -z "$q" ]; then
+    echo "选择首选音质 (解析失败时自动向下回退):"
+    local l
+    for l in "${LEVELS[@]}"; do
+      printf "  %d) %s (%s)%s\n" "$i" "$l" "${LEVEL_NAME[$l]}" \
+        "$([ "$l" = "$QUALITY" ] && echo "  <-- 当前")"
+      i=$((i + 1))
+    done
+    read -rp "请输入序号: " q < /dev/tty
+    [[ "$q" =~ ^[1-5]$ ]] || { warn "取消"; return 0; }
+    q="${LEVELS[$((q - 1))]}"
+  fi
+  local valid=0 l
+  for l in "${LEVELS[@]}"; do [ "$l" = "$q" ] && valid=1; done
+  [ "$valid" = 1 ] || { err "未知音质: $q"; return 1; }
+  QUALITY="$q"
+  save_config
+  ok "首选音质: $q (${LEVEL_NAME[$q]}), 回退顺序: $(fallback_levels | tr '\n' ' ')"
+}
+
+settings_menu() {
+  local c
+  while true; do
+    hr; echo "设置"; show_config
+    echo "1) 设置 API Key"
+    echo "2) 设置下载目录"
+    echo "3) 设置首选音质"
+    echo "4) 歌词保存开关 (当前: $([ "$SAVE_LRC" = 1 ] && echo 开 || echo 关))"
+    echo "5) 元数据嵌入开关 (当前: $([ "$EMBED_META" = 1 ] && echo 开 || echo 关))"
+    echo "0) 返回主菜单"
+    read -rp "请选择: " c < /dev/tty
+    case "$c" in
+      1) set_apikey "" ;;
+      2) set_savedir "" ;;
+      3) set_quality "" ;;
+      4) SAVE_LRC=$([ "$SAVE_LRC" = 1 ] && echo 0 || echo 1); save_config ;;
+      5) EMBED_META=$([ "$EMBED_META" = 1 ] && echo 0 || echo 1); save_config ;;
+      0) return 0 ;;
+      *) warn "无效选择" ;;
+    esac
+  done
+}
+
+# ---------------- 依赖安装 ----------------
+detect_pm() {
+  if command -v apt-get >/dev/null 2>&1; then echo "apt-get"
+  elif command -v dnf >/dev/null 2>&1; then echo "dnf"
+  elif command -v yum >/dev/null 2>&1; then echo "yum"
+  elif command -v apk >/dev/null 2>&1; then echo "apk"
+  elif command -v pacman >/dev/null 2>&1; then echo "pacman"
+  elif command -v pkg >/dev/null 2>&1; then echo "pkg"      # Termux
+  elif command -v brew >/dev/null 2>&1; then echo "brew"
+  else echo ""
+  fi
+}
+
+install_deps() {
+  local missing=() c
+  for c in curl jq; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+  if [ ${#missing[@]} = 0 ]; then
+    ok "必需依赖已齐全: curl, jq"
+  else
+    local pm sudo_cmd=""
+    pm="$(detect_pm)"
+    [ -z "$pm" ] && { err "未识别到包管理器, 请手动安装: ${missing[*]}"; return 1; }
+    [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
+    info "使用 $pm 安装: ${missing[*]}"
+    case "$pm" in
+      apt-get) $sudo_cmd apt-get update -qq && $sudo_cmd apt-get install -y "${missing[@]}" ;;
+      dnf|yum) $sudo_cmd "$pm" install -y "${missing[@]}" ;;
+      apk)     $sudo_cmd apk add "${missing[@]}" ;;
+      pacman)  $sudo_cmd pacman -Sy --noconfirm "${missing[@]}" ;;
+      pkg)     pkg install -y "${missing[@]}" ;;
+      brew)    brew install "${missing[@]}" ;;
+    esac || { err "依赖安装失败"; return 1; }
+    ok "依赖安装完成"
+  fi
+
+  # 可选: ffmpeg (封面/元数据嵌入)
+  if ! command -v ffmpeg >/dev/null 2>&1; then
+    local yn
+    read -rp "是否安装 ffmpeg (用于封面/元数据嵌入)? [y/N]: " yn < /dev/tty
+    if [[ "$yn" =~ ^[yY]$ ]]; then
+      local pm sudo_cmd=""
+      pm="$(detect_pm)"
+      [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
+      case "$pm" in
+        apt-get) $sudo_cmd apt-get install -y ffmpeg ;;
+        dnf|yum) $sudo_cmd "$pm" install -y ffmpeg ;;
+        apk)     $sudo_cmd apk add ffmpeg ;;
+        pacman)  $sudo_cmd pacman -Sy --noconfirm ffmpeg ;;
+        pkg)     pkg install -y ffmpeg ;;
+        brew)    brew install ffmpeg ;;
+        *) warn "未识别包管理器, 请手动安装 ffmpeg" ;;
+      esac
+    fi
+  else
+    ok "ffmpeg 已安装"
+  fi
+
+  # 可选: python3 + mutagen (标准歌词帧 USLT/LYRICS 嵌入, 原版 CDown 同款)
+  if command -v python3 >/dev/null 2>&1 && python3 -c "import mutagen" 2>/dev/null; then
+    ok "mutagen 已安装"
+  else
+    local yn2
+    read -rp "是否安装 mutagen (把歌词/封面嵌入歌曲文件, 播放器免刮削)? [y/N]: " yn2 < /dev/tty
+    if [[ "$yn2" =~ ^[yY]$ ]]; then
+      if ! python3 -m pip --version >/dev/null 2>&1; then
+        warn "未找到 pip, 请先安装 python3-pip 后重试"
+      elif python3 -m pip install --user -q mutagen 2>/dev/null || \
+           python3 -m pip install -q --break-system-packages mutagen 2>/dev/null; then
+        ok "mutagen 已安装"
+      else
+        warn "mutagen 安装失败, 可手动执行: python3 -m pip install mutagen"
+      fi
+    fi
+  fi
+}
+
+# ---------------- 安装 chksz 快捷命令 ----------------
+install_shortcut() {
+  local target="$HOME/.local/bin/chksz"
+  mkdir -p "$HOME/.local/bin"
+  cp -f "$SELF" "$target"
+  chmod +x "$target"
+  ok "已安装到 $target"
+  if ! echo "$PATH" | grep -q "$HOME/.local/bin"; then
+    {
+      echo ''
+      echo '# chksz 快捷命令'
+      echo 'export PATH="$HOME/.local/bin:$PATH"'
+    } >> "$HOME/.bashrc"
+    export PATH="$HOME/.local/bin:$PATH"
+    warn "已将 ~/.local/bin 加入 PATH (写入 ~/.bashrc), 重新登录或执行 source ~/.bashrc 生效"
+  fi
+  if command -v chksz >/dev/null 2>&1; then
+    ok "现在可以直接输入 chksz 唤出菜单"
+  else
+    info "本次终端可执行: export PATH=\"\$HOME/.local/bin:\$PATH\""
+  fi
+}
+
+# ---------------- 主菜单 ----------------
+banner() {
+  printf "${C_BOLD}${C_CYAN}"
+  cat <<'EOF'
+   ____ _     _  __ ____ _____
+  / ___| |__ | |/ // ___|__  /
+ | |   | '_ \| ' / \___ \ / /
+ | |___| | | | . \  ___) / /_
+  \____|_| |_|_|\_\|____/____|
+EOF
+  printf "${C_RESET}"
+  echo "  ChKSz API 交互式音乐下载 v$VERSION (网易云)"
+}
+
+main_menu() {
+  local c
+  while true; do
+    clear 2>/dev/null || true
+    banner
+    show_config
+    echo "1) 搜索歌曲下载"
+    echo "2) 歌单解析下载"
+    echo "3) 单曲 ID 直接下载"
+    echo "4) 设置 (Key/目录/音质)"
+    echo "5) 安装依赖"
+    echo "6) 安装 chksz 快捷命令"
+    echo "0) 退出"
+    read -rp "请选择: " c < /dev/tty
+    case "$c" in
+      1) do_search "" ;;
+      2) do_playlist "" ;;
+      3) do_song "" ;;
+      4) settings_menu ;;
+      5) install_deps ;;
+      6) install_shortcut ;;
+      0) echo "再见!"; exit 0 ;;
+      *) warn "无效选择" ;;
+    esac
+    echo; pause
+  done
+}
+
+usage() {
+  cat <<EOF
+chksz v$VERSION - ChKSz API 交互式音乐下载 (网易云)
+
+用法:
+  chksz                          进入交互菜单
+  chksz search "关键词"           搜索歌曲并选择下载
+  chksz playlist <ID或链接>      解析歌单并批量下载
+  chksz song <歌曲ID>            直接下载单曲
+  chksz key [apikey]             设置/更新 API Key (持久化保存)
+  chksz dir [下载目录]            设置下载位置
+  chksz quality [音质]           设置首选音质: jymaster|hires|lossless|exhigh|standard
+  chksz deps                     安装依赖 (curl/jq/ffmpeg)
+  chksz install                  安装 chksz 快捷命令到 ~/.local/bin
+  chksz config                   查看当前配置
+  chksz help                     显示本帮助
+
+配置保存在: $CONFIG_FILE
+API Key 获取: https://api.chksz.com (登录后查看个人密钥)
+EOF
+}
+
+# ---------------- 入口 ----------------
+main() {
+  load_config
+  local cmd="${1:-}"
+  case "$cmd" in
+    ""|menu)        main_menu ;;
+    search)         shift; do_search "${1:-}" ;;
+    playlist|pl)    shift; do_playlist "${1:-}" ;;
+    song|dl)        shift; do_song "${1:-}" ;;
+    key)            shift; set_apikey "${1:-}" ;;
+    dir)            shift; set_savedir "${1:-}" ;;
+    quality|q)      shift; set_quality "${1:-}" ;;
+    deps)           install_deps ;;
+    install)        install_shortcut ;;
+    config)         show_config ;;
+    help|--help|-h) usage ;;
+    version|--version|-v) echo "chksz v$VERSION" ;;
+    *) err "未知命令: $cmd"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
