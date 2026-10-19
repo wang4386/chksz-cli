@@ -591,6 +591,43 @@ detect_pm() {
   fi
 }
 
+# pkg_install <包名...> : 用系统包管理器安装软件包, 自动处理 sudo
+pkg_install() {
+  local pm sudo_cmd=""
+  pm="$(detect_pm)"
+  [ -z "$pm" ] && { err "未识别到包管理器, 请手动安装: $*"; return 1; }
+  [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
+  info "使用 $pm 安装: $*"
+  case "$pm" in
+    apt-get)
+      [ -z "${_APT_UPDATED:-}" ] && { $sudo_cmd apt-get update -qq; _APT_UPDATED=1; }
+      $sudo_cmd apt-get install -y "$@" ;;
+    dnf|yum) $sudo_cmd "$pm" install -y "$@" ;;
+    apk)     $sudo_cmd apk add "$@" ;;
+    pacman)  $sudo_cmd pacman -Sy --noconfirm "$@" ;;
+    pkg)     pkg install -y "$@" ;;
+    brew)    brew install "$@" ;;
+  esac
+}
+
+# pkg_name <通用名> : 返回当前发行版下的实际包名
+pkg_name() {
+  local pm
+  pm="$(detect_pm)"
+  case "$1" in
+    python3)
+      case "$pm" in pacman) echo "python" ;; *) echo "python3" ;; esac ;;
+    python3-pip)
+      case "$pm" in
+        apk) echo "py3-pip" ;;
+        pacman) echo "python-pip" ;;
+        pkg|brew) echo "python3" ;;  # Termux/brew 的 python 自带 pip
+        *) echo "python3-pip" ;;
+      esac ;;
+    *) echo "$1" ;;
+  esac
+}
+
 install_deps() {
   local missing=() c
   for c in curl jq; do
@@ -598,40 +635,18 @@ install_deps() {
   done
   if [ ${#missing[@]} = 0 ]; then
     ok "必需依赖已齐全: curl, jq"
-  else
-    local pm sudo_cmd=""
-    pm="$(detect_pm)"
-    [ -z "$pm" ] && { err "未识别到包管理器, 请手动安装: ${missing[*]}"; return 1; }
-    [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
-    info "使用 $pm 安装: ${missing[*]}"
-    case "$pm" in
-      apt-get) $sudo_cmd apt-get update -qq && $sudo_cmd apt-get install -y "${missing[@]}" ;;
-      dnf|yum) $sudo_cmd "$pm" install -y "${missing[@]}" ;;
-      apk)     $sudo_cmd apk add "${missing[@]}" ;;
-      pacman)  $sudo_cmd pacman -Sy --noconfirm "${missing[@]}" ;;
-      pkg)     pkg install -y "${missing[@]}" ;;
-      brew)    brew install "${missing[@]}" ;;
-    esac || { err "依赖安装失败"; return 1; }
+  elif pkg_install "${missing[@]}"; then
     ok "依赖安装完成"
+  else
+    err "依赖安装失败"; return 1
   fi
 
   # 可选: ffmpeg (封面/元数据嵌入)
   if ! command -v ffmpeg >/dev/null 2>&1; then
     local yn
     read -rp "是否安装 ffmpeg (用于封面/元数据嵌入)? [y/N]: " yn < /dev/tty
-    if [[ "$yn" =~ ^[yY]$ ]]; then
-      local pm sudo_cmd=""
-      pm="$(detect_pm)"
-      [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
-      case "$pm" in
-        apt-get) $sudo_cmd apt-get install -y ffmpeg ;;
-        dnf|yum) $sudo_cmd "$pm" install -y ffmpeg ;;
-        apk)     $sudo_cmd apk add ffmpeg ;;
-        pacman)  $sudo_cmd pacman -Sy --noconfirm ffmpeg ;;
-        pkg)     pkg install -y ffmpeg ;;
-        brew)    brew install ffmpeg ;;
-        *) warn "未识别包管理器, 请手动安装 ffmpeg" ;;
-      esac
+    if [[ "$yn" =~ ^[yY]$ ]] && ! pkg_install ffmpeg; then
+      warn "ffmpeg 安装失败, 可手动安装"
     fi
   else
     ok "ffmpeg 已安装"
@@ -644,10 +659,16 @@ install_deps() {
     local yn2
     read -rp "是否安装 mutagen (把歌词/封面嵌入歌曲文件, 播放器免刮削)? [y/N]: " yn2 < /dev/tty
     if [[ "$yn2" =~ ^[yY]$ ]]; then
+      # 先确保 python3 与 pip 存在, 缺失则自动安装
+      if ! command -v python3 >/dev/null 2>&1; then
+        pkg_install "$(pkg_name python3)" || { err "python3 安装失败"; return 1; }
+      fi
       if ! python3 -m pip --version >/dev/null 2>&1; then
-        warn "未找到 pip, 请先安装 python3-pip 后重试"
-      elif python3 -m pip install --user -q mutagen 2>/dev/null || \
-           python3 -m pip install -q --break-system-packages mutagen 2>/dev/null; then
+        info "pip 缺失, 正在自动安装..."
+        pkg_install "$(pkg_name python3-pip)" || { err "pip 安装失败"; return 1; }
+      fi
+      if python3 -m pip install --user -q mutagen 2>/dev/null || \
+         python3 -m pip install -q --break-system-packages mutagen 2>/dev/null; then
         ok "mutagen 已安装"
       else
         warn "mutagen 安装失败, 可手动执行: python3 -m pip install mutagen"
