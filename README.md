@@ -21,6 +21,8 @@
 | 音质依次回退 | `jymaster → hires → lossless → exhigh → standard`，从首选音质开始向下试 |
 | 快捷命令 `chksz` | `chksz install` 安装到 `~/.local/bin` 并配置 PATH |
 | Key 持久化 | 菜单 4 / `chksz key <apikey>`，保存到 `~/.config/chksz/config` (600 权限)，设置时自动校验 |
+| 下载记录 | 每次成功下载自动记入 `~/.config/chksz/history.tsv`（时间/歌曲 ID/歌名/歌手/专辑/实际音质/文件路径/.lrc 路径/下载时歌词状态），不含 API Key |
+| 歌词检测/修复 | 菜单 9 / `chksz check-lyrics`，按下载记录扫描已下载歌曲，实测文件里的歌词嵌入状态，发现缺失时可询问修复或用 `--fix` 自动修复 |
 
 附加: 断点续传、歌词 `.lrc` 落盘、元数据嵌入(可选)、文件名清洗与重名自动编号。
 
@@ -38,6 +40,33 @@
 实现优先级: `python3 + mutagen` (标准帧) > `ffmpeg` (封面+标签; 歌词只能进 TXXX，
 部分播放器不识别) > 跳过。`chksz deps` 可一键安装 mutagen。
 歌词原文 `.lrc` 文件也会一并保存 (可用设置关闭)。
+
+## 下载记录与歌词检测/修复 (v1.1.0)
+
+- 每次成功下载都会写一条记录到 `~/.config/chksz/history.tsv`，字段为时间、歌曲 ID、
+  歌名、歌手、专辑、实际音质、文件路径、`.lrc` 路径、下载时歌词状态
+  （`ok` / `partial` / `failed` / `no-lyric` / `skipped`）。历史是日志，修复后不会改写，
+  当前状态以检测实测为准。
+- 检测标准：MP3 看标准 USLT 帧（非空才算成功），FLAC 看 LYRICS 字段。
+  旧版 ffmpeg 遗留的 TXXX 歌词不算成功，只算“非标准帧”，修复时会换成标准帧。
+- 修复只动歌词：MP3 删旧 USLT/歌词类 TXXX 后加 USLT，FLAC 只写 LYRICS，
+  封面、标题/歌手/专辑等其他标签原样保留。
+- 歌词来源优先级：同名 `.lrc`（离线最可靠）> 按下载记录/ `--id` 给出的歌曲 ID
+  走 API 取歌词。既无同名 `.lrc` 又找不到 ID 时无法修复，会提示手动放同名 `.lrc`
+  或用 `--id` 指定。
+- 检测/修复都需要 `python3 + mutagen`（`chksz deps` 可装）；没有它会直接提示，
+  不会误报。
+
+```bash
+chksz history                 # 最近 50 条记录
+chksz history all             # 全部记录
+chksz check-lyrics            # 扫描全部下载记录, 发现缺失时询问是否修复
+chksz check-lyrics --fix      # 扫描并自动修复全部缺失/非标准帧
+chksz check-lyrics ~/Music/xx.mp3        # 只检测单个文件
+chksz fix-lyrics ~/Music/xx.mp3          # 修复单个文件
+chksz fix-lyrics ~/Music/xx.mp3 --id 123456
+chksz fix-lyrics --all         # 等同于 check-lyrics --fix
+```
 
 ## 在服务器上安装 (SSH)
 
@@ -82,7 +111,10 @@ chksz key <apikey>             设置 API Key
 chksz dir ~/Music              设置下载目录
 chksz quality lossless         设置首选音质
 chksz deps / install / config  依赖安装 / 安装快捷命令 / 查看配置
-chksz uninstall              安全卸载：删除脚本、配置、快捷命令，
+chksz history [N|all]        查看下载记录 (默认最近 50 条)
+chksz check-lyrics [--fix] [文件]  检测歌词嵌入, --fix 自动修复
+chksz fix-lyrics <文件> [--id ID] / fix-lyrics --all  修复歌词嵌入
+chksz uninstall              安全卸载：删除脚本、配置 (含下载记录) / 快捷命令，
                              依赖逐个询问（默认不删），歌曲文件默认保留
 ```
 
@@ -95,8 +127,10 @@ APIKEY="..."
 SAVE_DIR="/root/Music/chksz"
 QUALITY="jymaster"
 SAVE_LRC="1"
-EMBED_COVER="1"
+EMBED_META="1"
 ```
+
+下载记录在 `~/.config/chksz/history.tsv`（TSV，空字段用 `-` 占位），卸载时会随配置目录一起删除。
 
 ## 音质说明
 

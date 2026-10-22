@@ -13,16 +13,18 @@
 #   4) 依赖一键安装 (curl / jq / ffmpeg 可选)
 #   5) 音质按 jymaster > hires > lossless > exhigh > standard 依次回退
 #   6) `chksz install` 安装 chksz 快捷命令
+#   7) 下载记录 (history.tsv)，可检测已下载歌曲的歌词嵌入状态并可选修复
 #
 # 用法: chksz [search "关键词"|playlist <ID或链接>|song <歌曲ID>|key <apikey>|...]
 #       直接运行 chksz 进入交互菜单。
 
 set -u
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 API_BASE="https://api.chksz.com/api"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/chksz"
 CONFIG_FILE="$CONFIG_DIR/config"
+HISTORY_FILE="$CONFIG_DIR/history.tsv"
 
 # 音质等级: 从高到低
 LEVELS=(jymaster hires lossless exhigh standard)
@@ -259,7 +261,7 @@ download_song() {
   ok "  已保存: $target"
 
   # 歌词: 落盘 .lrc + 提取纯文本用于嵌入文件
-  local lrc_plain=""
+  local lrc_plain="" lrc_file="" lyric_status=""
   {
     local lrc_body lrc
     lrc_body="$(api_get 163_lyric "id=$id" 2>/dev/null)"
@@ -267,6 +269,7 @@ download_song() {
     if [ -n "$lrc" ] && [ "$lrc" != "null" ]; then
       if [ "$SAVE_LRC" = 1 ]; then
         printf '%s\n' "$lrc" > "${target%.*}.lrc"
+        lrc_file="${target%.*}.lrc"
         ok "  歌词已保存"
       fi
       # 去时间轴, 留纯文本 (同 CDown 的 parse_lrc_to_uslt)
@@ -275,18 +278,36 @@ download_song() {
   }
 
   # 元数据嵌入: 封面 + 标题/歌手/专辑 + 歌词 (播放器无需联网刮削)
+  # lyric_status 语义: ok=已入标准帧, partial=仅 ffmpeg 回退(歌词未入标准帧),
+  #   failed=嵌入失败/无工具, no-lyric=接口无歌词可嵌, skipped=嵌入开关已关
   if [ "$EMBED_META" = 1 ]; then
+    EMBED_STATUS="failed"
     embed_metadata "$target" "$pic" "$lrc_plain" "$name" "$artists" "$album"
+    if [ -z "$lrc_plain" ]; then
+      lyric_status="no-lyric"
+    else
+      lyric_status="$EMBED_STATUS"
+    fi
+  else
+    lyric_status="skipped"
   fi
+  # 下载记录: 只记成功下载的文件, 供后续 check-lyrics 扫描。
+  # 历史是日志, 不随后续修复改写; 当前嵌入状态以 check-lyrics 实测为准。
+  record_download "$id" "$name" "$artists" "$album" "${real_level:-$ok_level}" \
+    "$target" "$lrc_file" "$lyric_status"
   return 0
 }
 
 # embed_metadata <audio> <picUrl> <lyrics_plain> <title> <artist> <album>
 # 优先 python3+mutagen (写入标准 USLT/LYRICS 歌词帧, 同原版 CDown),
 # 回退 ffmpeg (封面+基础标签; 歌词只能进 TXXX, 部分播放器不识别)。
+# 调用方读全局 EMBED_STATUS: ok/partial/failed/no-lyric (见 download_song 注释)。
+# 返回值恒为 0, 嵌入失败不导致下载失败, 只记入下载记录。
+EMBED_STATUS="failed"
 embed_metadata() {
   local audio="$1" pic="$2" lyrics="$3" title="$4" artist="$5" album="$6"
   local ext="${audio##*.}" cover_tmp=""
+  EMBED_STATUS="failed"
   if [ -n "$pic" ] && [ "$pic" != "null" ]; then
     cover_tmp="$(mktemp --suffix=.jpg)"
     curl -fsSL --max-time 20 -o "$cover_tmp" "$pic" 2>/dev/null || cover_tmp=""
@@ -335,7 +356,13 @@ elif audio.lower().endswith('.flac'):
     a.save()
 print('embed-ok')
 PYEOF
-      ok "  元数据已嵌入 (封面/歌词/标签)"
+      if [ -n "$lyrics" ]; then
+        EMBED_STATUS="ok"
+        ok "  元数据已嵌入 (封面/歌词/标签)"
+      else
+        EMBED_STATUS="no-lyric"
+        ok "  元数据已嵌入 (封面/标签, 无歌词可嵌)"
+      fi
       rm -f "$cover_tmp"
       return 0
     fi
@@ -351,19 +378,439 @@ PYEOF
            -metadata title="$title" -metadata artist="$artist" \
            -metadata album="$album" "$tagged" 2>/dev/null; then
         mv -f "$tagged" "$audio"
+        EMBED_STATUS="partial"
         ok "  封面/标签已嵌入 (ffmpeg; 歌词未入标准帧, 建议安装 mutagen)"
       else
         rm -f "$tagged"
+        EMBED_STATUS="failed"
         warn "  ffmpeg 嵌入失败"
       fi
     else
+      EMBED_STATUS="failed"
       warn "  未安装 ffmpeg/mutagen, 跳过元数据嵌入 (菜单 5 可安装)"
     fi
   elif [ -z "$cover_tmp" ] && [ -n "$lyrics" ]; then
+    EMBED_STATUS="failed"
     warn "  无封面且无嵌入工具, 跳过元数据嵌入"
   fi
   rm -f "$cover_tmp"
   return 0
+}
+
+# ---------------- 下载记录 + 歌词检测/修复 ----------------
+# 记录格式 (TSV, 制表符分隔, 无 API Key):
+#   时间  歌曲ID  歌名  歌手  专辑  实际音质  文件路径  .lrc路径  下载时歌词状态
+# 下载时歌词状态: ok/partial/failed/no-lyric/skipped, 见 download_song。
+# 检测以文件实测为准, 不读记录里的旧状态, 所以修复后无需改写历史。
+
+escape_tsv() {
+  local s="$1"
+  s="${s//$'\t'/ }"
+  s="${s//$'\n'/ }"
+  s="${s//$'\r'/ }"
+  printf '%s' "$s"
+}
+
+record_download() {
+  local id="$1" title="$2" artist="$3" album="$4" level="$5"
+  local file="$6" lrc="$7" status="$8"
+  # 空字段用 - 占位: TSV 空字段在 bash read 里会被吞掉导致错位,
+  # 专辑、.lrc 都可能为空 (如 do_song 不传专辑、SAVE_LRC=0 时无 .lrc)。
+  [ -z "$title" ] && title="-"
+  [ -z "$artist" ] && artist="-"
+  [ -z "$album" ] && album="-"
+  [ -z "$level" ] && level="-"
+  [ -z "$lrc" ] && lrc="-"
+  [ -z "$status" ] && status="-"
+  mkdir -p "$CONFIG_DIR" 2>/dev/null || return 0
+  if [ ! -f "$HISTORY_FILE" ]; then
+    printf '#time\tid\ttitle\tartist\talbum\tlevel\tfile\tlrc\tlyric_status\n' > "$HISTORY_FILE"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" \
+    "$(escape_tsv "$id")" "$(escape_tsv "$title")" "$(escape_tsv "$artist")" \
+    "$(escape_tsv "$album")" "$(escape_tsv "$level")" "$(escape_tsv "$file")" \
+    "$(escape_tsv "$lrc")" "$(escape_tsv "$status")" >> "$HISTORY_FILE"
+}
+
+history_id_for_file() {
+  local f="$1"
+  [ -f "$HISTORY_FILE" ] || return 1
+  awk -F'\t' -v want="$f" '$1 !~ /^#/ && $7 == want {print $2; exit}' "$HISTORY_FILE"
+}
+
+show_history() {
+  local arg="${1:-}" total=0
+  if [ ! -f "$HISTORY_FILE" ]; then
+    warn "暂无下载记录 (成功下载后自动记录)"
+    return 0
+  fi
+  total="$(grep -vc '^#' "$HISTORY_FILE" 2>/dev/null)"
+  [ -z "$total" ] && total=0
+  if [ "$total" = "0" ]; then
+    warn "暂无下载记录 (成功下载后自动记录)"
+    return 0
+  fi
+  local limit=50
+  if [ "$arg" = "all" ]; then
+    limit="$total"
+  elif [[ "$arg" =~ ^[0-9]+$ ]]; then
+    limit="$arg"
+  fi
+  hr
+  printf "下载记录: 共 %s 条 (显示最近 %s 条)\n" "$total" "$limit"
+  hr
+  # 用 \x1f 作分隔符再读: \t 是 IFS 空白字符, read 会吞掉空字段导致错位;
+  # \x1f 是非空白分隔符, 空字段能原样保留 (见 record_download 的 - 占位说明)。
+  awk -F'\t' '!/^#/ {print $1 "\x1f" $2 "\x1f" $3 "\x1f" $4 "\x1f" $5 "\x1f" $6 "\x1f" $7 "\x1f" $8 "\x1f" $9}' \
+    "$HISTORY_FILE" | tail -n "$limit" | while IFS=$'\x1f' read -r ts sid title artist album level file lrc status; do
+    printf '%s | %s - %s | %s | 下载时歌词: %s\n  -> %s\n' \
+      "$ts" "$artist" "$title" "$level" "$status" "$file"
+  done
+  if [ "$total" -gt "$limit" ]; then
+    info "查看全部: chksz history all"
+  fi
+}
+
+lyric_status_label() {
+  case "$1" in
+    ok) echo "已嵌入标准歌词帧" ;;
+    missing) echo "未嵌入歌词" ;;
+    partial) echo "仅有非标准歌词帧 (部分播放器不识别)" ;;
+    missing-file) echo "文件已不存在" ;;
+    unsupported) echo "不支持的文件格式 (仅 MP3/FLAC)" ;;
+    no-tool) echo "无法检测 (缺 python3+mutagen)" ;;
+    error) echo "检测出错" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# lyric_check_status <文件> -> ok/missing/partial/missing-file/unsupported/no-tool/error
+# 判定标准: MP3 看标准 USLT 帧 (非空才算), FLAC 看 LYRICS 字段。
+# 旧版 ffmpeg 遗留的 TXXX 歌词不算成功, 只算 partial, 修复时会换成 USLT。
+lyric_check_status() {
+  local f="$1"
+  [ -f "$f" ] || { echo "missing-file"; return 0; }
+  if ! command -v python3 >/dev/null 2>&1 || ! python3 -c "import mutagen" 2>/dev/null; then
+    echo "no-tool"; return 0
+  fi
+  python3 - "$f" <<'PYEOF' 2>/dev/null || echo "error"
+import sys
+
+def txt(v):
+    if v is None:
+        return ""
+    if isinstance(v, (list, tuple)):
+        return " ".join(str(x) for x in v).strip()
+    return str(v).strip()
+
+path = sys.argv[1]
+try:
+    low = path.lower()
+    if low.endswith('.mp3'):
+        from mutagen.id3 import ID3
+        try:
+            tags = ID3(path)
+        except Exception:
+            print('missing'); sys.exit(0)
+        for fr in tags.getall('USLT'):
+            if txt(fr.text):
+                print('ok'); sys.exit(0)
+        for fr in tags.getall('TXXX'):
+            desc = (getattr(fr, 'desc', '') or '').lower()
+            if 'lyric' in desc or 'uslt' in desc:
+                if txt(fr.text):
+                    print('partial'); sys.exit(0)
+        print('missing')
+    elif low.endswith('.flac'):
+        from mutagen.flac import FLAC
+        try:
+            a = FLAC(path)
+        except Exception:
+            print('missing'); sys.exit(0)
+        vals = a.get('lyrics', [])
+        if any(txt(v) for v in vals):
+            print('ok')
+        else:
+            print('missing')
+    else:
+        print('unsupported')
+except Exception:
+    print('error')
+PYEOF
+}
+
+# lrc_to_plain <lrc文件> : 去时间轴、去 [ti:]/[ar:] 等纯元数据行, 输出纯文本歌词
+lrc_to_plain() {
+  local f="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$f" <<'PYEOF' 2>/dev/null
+import sys, re
+path = sys.argv[1]
+ts_re = re.compile(r'^\[\d+:\d+(?:\.\d+)?\]')
+meta_re = re.compile(r'^\[[A-Za-z]+:[^\]]*\]$')
+with open(path, encoding='utf-8', errors='ignore') as fh:
+    for line in fh:
+        s = line.strip()
+        if not s or meta_re.match(s):
+            continue
+        while ts_re.match(s):
+            s = ts_re.sub('', s, count=1).strip()
+        if s:
+            print(s)
+PYEOF
+  else
+    sed -E 's/^(\[[^]]*\])+//; s/^[[:space:]]+//' "$f" | sed '/^[[:space:]]*$/d'
+  fi
+}
+
+# embed_lyrics_only <音频> <纯文本歌词文件>
+# 只动歌词: MP3 删旧 USLT/歌词类 TXXX 后加 USLT, FLAC 只写 LYRICS。
+# 封面、标题/歌手/专辑等其他标签原样保留。返回: 0 成功, 2 歌词为空, 3 不支持格式。
+embed_lyrics_only() {
+  local audio="$1" plain="$2"
+  [ -f "$audio" ] && [ -f "$plain" ] || return 1
+  python3 - "$audio" "$plain" <<'PYEOF' 2>/dev/null
+import sys
+audio, plain_path = sys.argv[1:3]
+with open(plain_path, encoding='utf-8', errors='ignore') as fh:
+    lyrics = fh.read().strip()
+if not lyrics:
+    sys.exit(2)
+low = audio.lower()
+if low.endswith('.mp3'):
+    from mutagen.mp3 import MP3
+    from mutagen.id3 import ID3, USLT
+    a = MP3(audio, ID3=ID3)
+    if a.tags is None:
+        a.add_tags()
+    t = a.tags
+    for key in [k for k in list(t.keys()) if k.startswith('USLT')]:
+        del t[key]
+    for key in [k for k in list(t.keys()) if k.startswith('TXXX')]:
+        desc = (getattr(t[key], 'desc', '') or '').lower()
+        if 'lyric' in desc or 'uslt' in desc:
+            del t[key]
+    t.add(USLT(encoding=3, lang='eng', desc='', text=lyrics))
+    a.save()
+elif low.endswith('.flac'):
+    from mutagen.flac import FLAC
+    a = FLAC(audio)
+    a['lyrics'] = lyrics
+    a.save()
+else:
+    sys.exit(3)
+print('fix-ok')
+PYEOF
+}
+
+# fix_one_file <文件> [歌曲ID]
+# 歌词来源优先级: 1) 同名 .lrc (离线, 最可靠)  2) 下载记录/--id 查到的 ID 走 API 拿歌词
+# 结果写入全局 FIX_RESULT: ok/already-ok/no-lyric/no-source/no-apikey/
+#   missing-file/unsupported/no-tool/failed
+FIX_RESULT="failed"
+fix_one_file() {
+  local f="$1" sid="${2:-}"
+  FIX_RESULT="failed"
+  local st
+  st="$(lyric_check_status "$f")"
+  case "$st" in
+    ok)
+      ok "  已有标准歌词帧, 无需修复: $f"
+      FIX_RESULT="already-ok"; return 0 ;;
+    missing-file)
+      err "  文件已不存在: $f"
+      FIX_RESULT="missing-file"; return 1 ;;
+    no-tool)
+      err "  检测/修复需 python3+mutagen, 先运行: chksz deps"
+      FIX_RESULT="no-tool"; return 1 ;;
+    unsupported)
+      warn "  不支持的文件格式 (仅 MP3/FLAC): $f"
+      FIX_RESULT="unsupported"; return 1 ;;
+    error)
+      err "  检测出错, 跳过: $f"
+      FIX_RESULT="error"; return 1 ;;
+  esac
+  # 此时 st 为 missing 或 partial, 需要歌词来源
+  [ -z "$sid" ] && sid="$(history_id_for_file "$f")"
+  local src_tmp plain_tmp lrc_src=""
+  src_tmp="$(mktemp)"; plain_tmp="$(mktemp)"
+  if [ -f "${f%.*}.lrc" ]; then
+    lrc_src="${f%.*}.lrc"
+    cp "$lrc_src" "$src_tmp"
+    info "  歌词来源: 同名 .lrc"
+  elif [ -n "$sid" ]; then
+    require_apikey || { rm -f "$src_tmp" "$plain_tmp"; FIX_RESULT="no-apikey"; return 1; }
+    local body lrc code
+    body="$(api_get 163_lyric "id=$sid" 2>/dev/null)"
+    code="$(api_code "$body")"
+    if [ "$code" = "401" ]; then
+      rm -f "$src_tmp" "$plain_tmp"
+      err "  API Key 无效 (401), 无法从接口取歌词"
+      FIX_RESULT="no-apikey"; return 1
+    fi
+    lrc="$(jq -r '.data.lrc // empty' <<<"$body" 2>/dev/null)"
+    if [ -z "$lrc" ] || [ "$lrc" = "null" ]; then
+      rm -f "$src_tmp" "$plain_tmp"
+      warn "  接口无歌词, 无法修复 (可能为纯音乐/无歌词歌曲): $f"
+      FIX_RESULT="no-lyric"; return 0
+    fi
+    printf '%s\n' "$lrc" > "$src_tmp"
+    info "  歌词来源: API (歌曲 ID $sid)"
+    if [ "$SAVE_LRC" = 1 ] && [ ! -f "${f%.*}.lrc" ]; then
+      cp "$src_tmp" "${f%.*}.lrc"
+      info "  歌词已补存为同名 .lrc"
+    fi
+  else
+    rm -f "$src_tmp" "$plain_tmp"
+    warn "  无同名 .lrc, 且下载记录中找不到歌曲 ID, 无法获取歌词: $f"
+    warn "  可手动放同名 .lrc 后再修, 或用: chksz fix-lyrics \"$f\" --id <歌曲ID>"
+    FIX_RESULT="no-source"; return 1
+  fi
+  lrc_to_plain "$src_tmp" > "$plain_tmp"
+  if [ ! -s "$plain_tmp" ]; then
+    rm -f "$src_tmp" "$plain_tmp"
+    warn "  歌词内容为空, 无法修复 (可能为纯音乐/无歌词歌曲): $f"
+    FIX_RESULT="no-lyric"; return 0
+  fi
+  local rc=0
+  embed_lyrics_only "$f" "$plain_tmp" >/dev/null; rc=$?
+  rm -f "$src_tmp" "$plain_tmp"
+  if [ "$rc" = "2" ]; then
+    warn "  歌词内容为空, 无法修复: $f"
+    FIX_RESULT="no-lyric"; return 0
+  fi
+  if [ "$rc" != "0" ]; then
+    err "  歌词嵌入失败: $f"
+    FIX_RESULT="failed"; return 1
+  fi
+  if [ "$(lyric_check_status "$f")" = "ok" ]; then
+    ok "  已修复: $f"
+    FIX_RESULT="ok"; return 0
+  fi
+  warn "  嵌入后复测仍未通过: $f"
+  FIX_RESULT="failed"; return 1
+}
+
+# check_lyrics_cmd [--fix] [文件]
+# 无文件参数时扫描全部下载记录; 有文件参数时只检测该文件。
+# 不带 --fix 且发现缺失时, 有 TTY 就询问是否修复, 无 TTY 只提示命令。
+check_lyrics_cmd() {
+  local do_fix=0 target=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --fix) do_fix=1 ;;
+      -*) err "未知选项: $1 (用法: chksz check-lyrics [--fix] [文件])"; return 1 ;;
+      *) target="$1" ;;
+    esac
+    shift
+  done
+
+  if [ -n "$target" ]; then
+    local st
+    st="$(lyric_check_status "$target")"
+    printf '%s: %s\n' "$target" "$(lyric_status_label "$st")"
+    if [ "$st" = "missing" ] || [ "$st" = "partial" ]; then
+      if [ "$do_fix" = "0" ]; then
+        local yn=""
+        if [ -t 0 ]; then
+          read -rp "是否修复这首? [y/N]: " yn
+        fi
+        [[ "$yn" =~ ^[yY]$ ]] && do_fix=1
+      fi
+      [ "$do_fix" = "1" ] && fix_one_file "$target" ""
+    fi
+    return 0
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1 || ! python3 -c "import mutagen" 2>/dev/null; then
+    err "检测需 python3+mutagen, 先运行: chksz deps"
+    return 1
+  fi
+  if [ ! -f "$HISTORY_FILE" ]; then
+    warn "暂无下载记录, 先下载歌曲或用 chksz check-lyrics <文件> 检测单个文件"
+    return 0
+  fi
+  local total=0 okc=0 missc=0 partialc=0 missfile=0 unsup=0 errc=0
+  local -a fix_files=() fix_ids=()
+  while IFS=$'\x1f' read -r ts sid title artist album level file lrc status; do
+    total=$((total + 1))
+    if [ ! -f "$file" ]; then
+      missfile=$((missfile + 1))
+      printf '[文件已不存在] %s - %s\n  -> %s\n' "$artist" "$title" "$file"
+      continue
+    fi
+    local st
+    st="$(lyric_check_status "$file")"
+    case "$st" in
+      ok) okc=$((okc + 1)); printf '[已嵌入] %s - %s\n' "$artist" "$title" ;;
+      missing)
+        missc=$((missc + 1)); fix_files+=("$file"); fix_ids+=("$sid")
+        printf '[未嵌入] %s - %s\n  -> %s\n' "$artist" "$title" "$file" ;;
+      partial)
+        partialc=$((partialc + 1)); fix_files+=("$file"); fix_ids+=("$sid")
+        printf '[非标准帧] %s - %s\n  -> %s\n' "$artist" "$title" "$file" ;;
+      unsupported)
+        unsup=$((unsup + 1)); printf '[不支持格式] %s - %s\n  -> %s\n' "$artist" "$title" "$file" ;;
+      *) errc=$((errc + 1)); printf '[检测出错] %s - %s\n  -> %s\n' "$artist" "$title" "$file" ;;
+    esac
+  done < <(awk -F'\t' '!/^#/ {print $1 "\x1f" $2 "\x1f" $3 "\x1f" $4 "\x1f" $5 "\x1f" $6 "\x1f" $7 "\x1f" $8 "\x1f" $9}' "$HISTORY_FILE")
+  hr
+  printf '检测完成: 共 %s 条记录, 已嵌入 %s, 未嵌入 %s, 非标准帧 %s, 文件已不存在 %s, 不支持格式 %s, 出错 %s\n' \
+    "$total" "$okc" "$missc" "$partialc" "$missfile" "$unsup" "$errc"
+  local fixable=$((missc + partialc))
+  if [ "$fixable" = "0" ]; then
+    ok "无需修复"
+    return 0
+  fi
+  if [ "$do_fix" = "0" ]; then
+    # 只在 stdin 是终端时询问, 非交互运行不碰 /dev/tty (无控制终端时会报
+    # "/dev/tty: No such device"), 直接提示 --fix 命令。
+    local yn=""
+    if [ -t 0 ]; then
+      read -rp "是否修复以上 $fixable 首? [y/N]: " yn
+    fi
+    [[ "$yn" =~ ^[yY]$ ]] || { info "未修复, 需要时执行: chksz check-lyrics --fix"; return 0; }
+    do_fix=1
+  fi
+  local fixed=0 failed=0 nolyric=0 i
+  for ((i = 0; i < ${#fix_files[@]}; i++)); do
+    printf '%s - %s\n' "" ""
+    info "修复: ${fix_files[$i]}"
+    if fix_one_file "${fix_files[$i]}" "${fix_ids[$i]}"; then
+      fixed=$((fixed + 1))
+    elif [ "$FIX_RESULT" = "no-lyric" ]; then
+      nolyric=$((nolyric + 1))
+    else
+      failed=$((failed + 1))
+    fi
+  done
+  hr
+  printf '修复完成: 成功 %s, 无歌词可修 %s, 失败 %s\n' "$fixed" "$nolyric" "$failed"
+}
+
+# fix_lyrics_cmd <文件> [--id ID] | fix_lyrics_cmd --all
+fix_lyrics_cmd() {
+  local do_all=0 sid="" target=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) do_all=1 ;;
+      --id) shift; sid="${1:-}" ;;
+      --id=*) sid="${1#--id=}" ;;
+      -*) err "未知选项: $1"; return 1 ;;
+      *) target="$1" ;;
+    esac
+    shift
+  done
+  if [ "$do_all" = "1" ]; then
+    check_lyrics_cmd --fix
+    return $?
+  fi
+  if [ -z "$target" ]; then
+    err "用法: chksz fix-lyrics <文件> [--id <歌曲ID>] 或 chksz fix-lyrics --all"
+    return 1
+  fi
+  fix_one_file "$target" "$sid"
 }
 
 # ---------------- 搜索下载 ----------------
@@ -708,7 +1155,7 @@ uninstall() {
   echo "卸载 chksz (安全模式, 每一步都会询问)"
   echo "将执行:"
   echo "  1. 删除快捷命令: $HOME/.local/bin/chksz"
-  echo "  2. 删除配置目录: $CONFIG_DIR (含 API Key)"
+  echo "  2. 删除配置目录: $CONFIG_DIR (含 API Key 与下载记录)"
   echo "  3. 清理 ~/.bashrc 中的 PATH 设置"
   echo "  4. 逐个询问是否移除依赖 (curl/jq/ffmpeg/mutagen, 默认不移除)"
   echo "  5. 询问是否保留已下载歌曲 (默认保留)"
@@ -821,6 +1268,8 @@ main_menu() {
     echo "5) 安装依赖"
     echo "6) 安装 chksz 快捷命令"
     echo "7) 卸载 chksz"
+    echo "8) 下载记录"
+    echo "9) 检测/修复歌词嵌入"
     echo "0) 退出"
     read -rp "请选择: " c < /dev/tty
     case "$c" in
@@ -831,6 +1280,8 @@ main_menu() {
       5) install_deps ;;
       6) install_shortcut ;;
       7) uninstall ;;
+      8) show_history "" ;;
+      9) check_lyrics_cmd ;;
       0) echo "再见!"; exit 0 ;;
       *) warn "无效选择" ;;
     esac
@@ -853,6 +1304,13 @@ chksz v$VERSION - ChKSz API 交互式音乐下载 (网易云)
   chksz deps                     安装依赖 (curl/jq/ffmpeg)
   chksz install                  安装 chksz 快捷命令到 ~/.local/bin
   chksz uninstall                安全卸载 (删脚本/配置/快捷命令, 逐项确认)
+  chksz history [N|all]          查看下载记录 (默认最近 50 条, 在 ~/.config/chksz/history.tsv)
+  chksz check-lyrics [--fix] [文件]
+                                 检测歌词嵌入: 无参数扫描全部下载记录, 有文件只测该文件;
+                                 --fix 自动修复, 不带则发现缺失时询问是否修复
+  chksz fix-lyrics <文件> [--id ID]
+                                 修复单个文件 (优先同名 .lrc, 否则按 ID 走 API 取歌词)
+  chksz fix-lyrics --all         修复下载记录中全部缺失/非标准帧的歌曲
   chksz config                   查看当前配置
   chksz help                     显示本帮助
 
@@ -876,6 +1334,9 @@ main() {
     deps)           install_deps ;;
     install)        install_shortcut ;;
     uninstall)      uninstall ;;
+    history)        shift; show_history "${1:-}" ;;
+    check-lyrics)   shift; check_lyrics_cmd "$@" ;;
+    fix-lyrics)     shift; fix_lyrics_cmd "$@" ;;
     config)         show_config ;;
     help|--help|-h) usage ;;
     version|--version|-v) echo "chksz v$VERSION" ;;

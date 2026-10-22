@@ -33,7 +33,10 @@ chksz quality <音质>        # 设置首选音质：jymaster|hires|lossless|exh
 chksz config                # 查看当前配置（Key 打码显示）
 chksz deps                  # 安装依赖
 chksz install               # 安装 chksz 快捷命令
-chksz uninstall             # 安全卸载：删脚本/配置/快捷命令，依赖逐个询问（默认不删），歌曲默认保留
+chksz uninstall             # 安全卸载：删脚本/配置（含下载记录）/快捷命令，依赖逐个询问（默认不删），歌曲默认保留
+chksz history [N|all]       # 查看下载记录（默认最近 50 条）
+chksz check-lyrics [--fix] [文件]  # 检测歌词嵌入：无参数扫描全部下载记录；--fix 自动修复
+chksz fix-lyrics <文件> [--id ID]  # 修复单个文件；fix-lyrics --all 修复记录中全部缺失项
 chksz help                  # 帮助
 ```
 
@@ -50,6 +53,11 @@ printf 'all\n' | script -qec "chksz playlist 5202687076" /dev/null
 
 - 配置文件在 `~/.config/chksz/config`，权限 600，格式为 `KEY="value"`。五个键：`APIKEY`、`SAVE_DIR`、`QUALITY`、`SAVE_LRC`（1 保存 .lrc）、`EMBED_META`（1 嵌入元数据）。
 
+- 下载记录在 `~/.config/chksz/history.tsv`（TSV，不含 API Key），每次成功下载写一条：
+  时间、歌曲 ID、歌名、歌手、专辑、实际音质、文件路径、`.lrc` 路径、下载时歌词状态
+  （`ok` / `partial` / `failed` / `no-lyric` / `skipped`）。历史是日志，修复后不改写；
+  当前嵌入状态以 `check-lyrics` 实测为准。卸载时会随配置目录一起删除。
+
 - `APIKEY` 是 ChKSz API 的个人密钥，在 https://api.chksz.com 登录后获取。所有 `163_*` 接口都必须带 `apikey` 参数，否则返回 401。不要在对话里索取或复述 Key，用 `chksz key` 让用户自己设置。
 
 ## 音质与回退
@@ -65,6 +73,15 @@ printf 'all\n' | script -qec "chksz playlist 5202687076" /dev/null
 - 开启 `EMBED_META` 时自动嵌入元数据，播放器无需联网刮削。优先 `python3 + mutagen`：MP3 写入标准 USLT 歌词帧（去时间轴纯文本）、APIC 封面、TIT2/TPE1/TALB 标签；FLAC 写入 LYRICS 字段、内嵌封面、Vorbis 标签。没有 mutagen 时回退到 `ffmpeg`（封面加基础标签，歌词只能进 TXXX）。
 
 - 歌词原文同时保存为同名的 `.lrc` 文件（`SAVE_LRC=0` 可关闭）。
+
+- 歌词检测/修复（v1.1.0，需 `python3 + mutagen`，`chksz deps` 可装）：
+  检测标准是 MP3 的标准 USLT 帧（非空才算）、FLAC 的 LYRICS 字段；
+  旧版 ffmpeg 遗留的 TXXX 歌词只算 partial，不算成功。
+  修复只动歌词（MP3 删旧 USLT/歌词类 TXXX 后加 USLT，FLAC 只写 LYRICS），
+  封面和标题/歌手/专辑原样保留。
+  歌词来源优先级：同名 `.lrc` > 按记录/`--id` 的歌曲 ID 走 API 取歌词；
+  既无 `.lrc` 又无 ID 时无法修复（纯音乐/接口无歌词会报 `no-lyric`，不是失败）。
+  非交互场景用 `check-lyrics --fix` 或 `fix-lyrics --all`，不要等交互询问。
 
 ## 注意事项
 
