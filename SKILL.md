@@ -35,6 +35,8 @@ chksz deps                  # 安装依赖
 chksz install               # 安装 chksz 快捷命令
 chksz uninstall             # 安全卸载：删脚本/配置（含下载记录）/快捷命令，依赖逐个询问（默认不删），歌曲默认保留
 chksz history [N|all]       # 查看下载记录（默认最近 50 条）
+chksz check-update          # 检查更新（只报告版本对比，不改动）
+chksz update [--force]      # 更新脚本本身（见下，代跑前先向用户确认）
 chksz check-lyrics [--fix] [文件]  # 检测歌词嵌入：无参数扫描全部下载记录；--fix 自动修复
 chksz fix-lyrics <文件> [--id ID]  # 修复单个文件；fix-lyrics --all 修复记录中全部缺失项
 chksz help                  # 帮助
@@ -68,7 +70,23 @@ printf 'all\n' | script -qec "chksz playlist 5202687076" /dev/null
 
 ## 下载产物
 
-- 文件名格式为 `歌手 - 歌名.扩展名`，非法字符替换为下划线，重名自动加 `(2)` 编号。下载支持断点续传（`.downloading` 临时文件）。
+- 文件名格式为 `歌手 - 歌名.扩展名`，非法字符替换为下划线。下载支持断点续传（`.downloading` 临时文件）。
+
+- 检查更新/自更新（v1.3.0）：更新源是 GitHub 仓库的 `chksz` 原文件，
+  环境变量 `CHKSZ_RAW_URL` 可覆盖（与 install.sh 同一约定）。
+  `chksz update` 非交互运行时不询问、直接更新——命令本身即确认，
+  所以 agent 代跑前必须先向用户说明并得到同意，不要自行升级用户机器上的脚本。
+  更新会先下载到同目录临时文件并校验（非空/bash shebang/有版本号/`bash -n` 通过），
+  默认不降级、不重装同版本（`--force` 才允许）；替换前自动备份到脚本旁的
+  `chksz.bak`，替换后跑新版 `version` 复核，失败自动回滚。
+  脚本不做启动时自动检查，日常命令不联网检查更新。
+
+- 同名文件处理（v1.2.0）：解析成功、下载之前，若下载目录已有同名文件，
+  有 TTY 时询问 `1 覆盖 / 2 创建副本（默认）/ 3 跳过`；无 TTY 时默认创建副本，
+  绝不默认覆盖。agent 非交互调用会走默认副本，旧文件不会被动。
+  覆盖时旧同名 `.lrc` 会被清掉（防新歌无歌词时残留旧歌词），
+  且 `history.tsv` 中该路径的旧记录会被新记录替换；副本走新路径，记录另加一条。
+  跳过时 `download_song` 返回 3，搜索/歌单统计单列跳过数，`chksz song` 跳过后正常返回 0。
 
 - 开启 `EMBED_META` 时自动嵌入元数据，播放器无需联网刮削。优先 `python3 + mutagen`：MP3 写入标准 USLT 歌词帧（去时间轴纯文本）、APIC 封面、TIT2/TPE1/TALB 标签；FLAC 写入 LYRICS 字段、内嵌封面、Vorbis 标签。没有 mutagen 时回退到 `ffmpeg`（封面加基础标签，歌词只能进 TXXX）。
 

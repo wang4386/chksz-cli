@@ -14,14 +14,18 @@
 #   5) 音质按 jymaster > hires > lossless > exhigh > standard 依次回退
 #   6) `chksz install` 安装 chksz 快捷命令
 #   7) 下载记录 (history.tsv)，可检测已下载歌曲的歌词嵌入状态并可选修复
+#   8) 下载时若目录中已有同名文件, 先询问覆盖/创建副本/跳过 (无 TTY 默认副本)
+#   9) 检查更新与自更新: chksz check-update 比对远程版本, chksz update 安全更新
 #
 # 用法: chksz [search "关键词"|playlist <ID或链接>|song <歌曲ID>|key <apikey>|...]
 #       直接运行 chksz 进入交互菜单。
 
 set -u
 
-VERSION="1.1.0"
+VERSION="1.3.0"
 API_BASE="https://api.chksz.com/api"
+# 更新源: 与 install.sh 的 CHKSZ_RAW_URL 同一约定, 可用环境变量覆盖 (镜像/自建源)
+UPDATE_URL="${CHKSZ_RAW_URL:-https://raw.githubusercontent.com/wang4386/chksz-cli/main/chksz}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/chksz"
 CONFIG_FILE="$CONFIG_DIR/config"
 HISTORY_FILE="$CONFIG_DIR/history.tsv"
@@ -189,6 +193,74 @@ unique_path() {
   printf '%s' "$p"
 }
 
+# resolve_download_target <目录> <文件名(不含扩展)> <扩展>
+# 结果写全局 RESOLVED_TARGET / CONFLICT_ACTION(new/overwrite/copy/skip)；
+# 返回 3 表示用户选了跳过, 其余返回 0。
+# 在解析成功、真正下载之前调用, 同名冲突不白白消耗下载流量。
+# 无同名文件直接用原名；有同名且能打开 /dev/tty 时询问：
+#   1) 覆盖  2) 创建副本 (默认, 回车即选)  3) 跳过这首
+# 无 TTY (脚本/管道调用) 时无法询问, 默认创建副本 — 不覆盖是最安全的
+# 默认值, 也与旧版「重名自动编号」行为一致。
+RESOLVED_TARGET=""
+CONFLICT_ACTION="new"
+resolve_download_target() {
+  local dir="$1" base="$2" ext="$3"
+  local plain="$dir/$base.$ext"
+  RESOLVED_TARGET="$plain"
+  CONFLICT_ACTION="new"
+  [ -e "$plain" ] || return 0
+
+  local size_info=""
+  size_info="$(ls -lh "$plain" 2>/dev/null | awk '{print $5}')"
+  warn "  文件已存在: $plain${size_info:+ (大小 $size_info)}"
+  if ! (: < /dev/tty) 2>/dev/null; then
+    warn "  当前无法询问, 自动创建副本"
+    CONFLICT_ACTION="copy"
+    RESOLVED_TARGET="$(unique_path "$dir" "$base" "$ext")"
+    return 0
+  fi
+  echo "  请选择: 1) 覆盖原文件  2) 创建副本 (默认)  3) 跳过这首"
+  local choice=""
+  while true; do
+    if ! read -rp "  输入序号 [1/2/3]: " choice < /dev/tty; then
+      # 读不到输入 (EOF) 时按默认走副本, 不无限重试
+      choice=""
+      CONFLICT_ACTION="copy"
+      RESOLVED_TARGET="$(unique_path "$dir" "$base" "$ext")"
+      info "  未收到选择, 自动创建副本: $(basename "$RESOLVED_TARGET")"
+      return 0
+    fi
+    case "$choice" in
+      1|o|O)
+        CONFLICT_ACTION="overwrite"
+        RESOLVED_TARGET="$plain"
+        return 0 ;;
+      ""|2|c|C)
+        CONFLICT_ACTION="copy"
+        RESOLVED_TARGET="$(unique_path "$dir" "$base" "$ext")"
+        return 0 ;;
+      3|s|S|q)
+        CONFLICT_ACTION="skip"
+        info "  已跳过: $(basename "$plain")"
+        return 3 ;;
+      *)
+        warn "  无效选择, 请重新输入" ;;
+    esac
+  done
+}
+
+# remove_history_for_file <文件路径> : 从下载记录中删掉该路径的旧记录。
+# 只在「覆盖」下载时调用: 旧文件内容已被新文件取代, 旧记录留着会让
+# check-lyrics 对着新文件按旧元数据重复检测。副本下载走新路径, 不受影响。
+remove_history_for_file() {
+  local f="$1" tmp=""
+  [ -f "$HISTORY_FILE" ] || return 0
+  tmp="$(mktemp)" || return 0
+  awk -F'\t' -v want="$f" '$1 ~ /^#/ || $7 != want' "$HISTORY_FILE" > "$tmp" \
+    && mv -f "$tmp" "$HISTORY_FILE" || rm -f "$tmp"
+  return 0
+}
+
 # 解析 "1 3 5-8" / "all" 为序号列表 (每行一个, 1-based), $1=输入 $2=上限
 expand_selection() {
   local input="$1" max="$2" tok a b i
@@ -209,6 +281,7 @@ expand_selection() {
 
 # ---------------- 核心: 单曲解析 + 下载 ----------------
 # download_song <id> <name> <artists> <album> <picUrl>
+# 返回: 0 成功, 1 失败, 2 API Key 无效, 3 用户跳过同名文件
 download_song() {
   local id="$1" name="$2" artists="$3" album="$4" pic="$5"
   local lvl body url real_level size br
@@ -244,7 +317,13 @@ download_song() {
   ext="${LEVEL_EXT[$ok_level]}"
   mkdir -p "$SAVE_DIR"
   base="$(sanitize "$artists - $name")"
-  target="$(unique_path "$SAVE_DIR" "$base" "$ext")"
+  # 同名文件处理: 已存在时询问覆盖/副本/跳过 (详见 resolve_download_target)
+  local is_overwrite=0
+  if ! resolve_download_target "$SAVE_DIR" "$base" "$ext"; then
+    return 3
+  fi
+  target="$RESOLVED_TARGET"
+  [ "$CONFLICT_ACTION" = "overwrite" ] && is_overwrite=1
   tmpfile="$target.downloading"
 
   info "  下载 -> $(basename "$target")"
@@ -259,6 +338,11 @@ download_song() {
   fi
   mv -f "$tmpfile" "$target"
   ok "  已保存: $target"
+  if [ "$is_overwrite" = 1 ]; then
+    # 覆盖时清掉旧同名 .lrc: 下面歌词步骤会按新歌词重建,
+    # 若新歌无歌词, 残留旧 .lrc 会被误认成本次下载的歌词。
+    rm -f "${target%.*}.lrc"
+  fi
 
   # 歌词: 落盘 .lrc + 提取纯文本用于嵌入文件
   local lrc_plain="" lrc_file="" lyric_status=""
@@ -293,6 +377,10 @@ download_song() {
   fi
   # 下载记录: 只记成功下载的文件, 供后续 check-lyrics 扫描。
   # 历史是日志, 不随后续修复改写; 当前嵌入状态以 check-lyrics 实测为准。
+  # 例外: 覆盖下载先删该路径的旧记录再记新账 (理由见 remove_history_for_file)。
+  if [ "$is_overwrite" = 1 ]; then
+    remove_history_for_file "$target"
+  fi
   record_download "$id" "$name" "$artists" "$album" "${real_level:-$ok_level}" \
     "$target" "$lrc_file" "$lyric_status"
   return 0
@@ -850,7 +938,7 @@ do_search() {
   mapfile -t ids < <(expand_selection "$sel" "$count")
   [ ${#ids[@]} = "0" ] && { warn "未选择有效序号"; return 1; }
 
-  local idx sid nm ar al pic okc=0 failc=0
+  local idx sid nm ar al pic okc=0 failc=0 skipc=0 drc=0
   for idx in "${ids[@]}"; do
     i=$((idx - 1))
     sid="$(jq -r ".data.songs[$i].id" <<<"$body")"
@@ -858,15 +946,16 @@ do_search() {
     ar="$(jq -r ".data.songs[$i].artists" <<<"$body")"
     al="$(jq -r ".data.songs[$i].album" <<<"$body")"
     pic="$(jq -r ".data.songs[$i].picUrl // empty" <<<"$body")"
-    if download_song "$sid" "$nm" "$ar" "$al" "$pic"; then
-      okc=$((okc + 1))
-    else
-      failc=$((failc + 1))
-    fi
+    download_song "$sid" "$nm" "$ar" "$al" "$pic"; drc=$?
+    case "$drc" in
+      0) okc=$((okc + 1)) ;;
+      3) skipc=$((skipc + 1)) ;;
+      *) failc=$((failc + 1)) ;;
+    esac
     n=$((n + 1))
     echo
   done
-  ok "完成: 成功 $okc 首, 失败 $failc 首"
+  ok "完成: 成功 $okc 首, 失败 $failc 首, 跳过 $skipc 首"
 }
 
 # ---------------- 歌单解析下载 ----------------
@@ -918,7 +1007,7 @@ do_playlist() {
   [ "$sel" = "q" ] && return 0
   [ -z "$sel" ] && sel="all"
 
-  local idx sid nm ar al pic okc=0 failc=0 n=0
+  local idx sid nm ar al pic okc=0 failc=0 skipc=0 n=0 drc=0
   while read -r idx; do
     i=$((idx - 1))
     sid="$(jq -r ".data.tracks[$i].id" <<<"$body")"
@@ -927,14 +1016,15 @@ do_playlist() {
     al="$(jq -r ".data.tracks[$i].al.name // empty" <<<"$body")"
     pic="$(jq -r ".data.tracks[$i].al.picUrl // empty" <<<"$body")"
     printf "${C_BOLD}[$((n+1))]%s${C_RESET}\n" ""
-    if download_song "$sid" "$nm" "$ar" "$al" "$pic"; then
-      okc=$((okc + 1))
-    else
-      failc=$((failc + 1))
-    fi
+    download_song "$sid" "$nm" "$ar" "$al" "$pic"; drc=$?
+    case "$drc" in
+      0) okc=$((okc + 1)) ;;
+      3) skipc=$((skipc + 1)) ;;
+      *) failc=$((failc + 1)) ;;
+    esac
     n=$((n + 1)); echo
   done < <(expand_selection "$sel" "$tcount")
-  ok "歌单下载完成: 成功 $okc 首, 失败 $failc 首"
+  ok "歌单下载完成: 成功 $okc 首, 失败 $failc 首, 跳过 $skipc 首"
 }
 
 # ---------------- 单曲 ID 直接下载 ----------------
@@ -947,7 +1037,14 @@ do_song() {
   # 先用 lyric 接口顺手拿到歌曲名/歌手信息做文件名 (失败则用 ID)
   body="$(api_get 163_lyric "id=$sid" 2>/dev/null)"
   nm=""; ar=""; al=""; pic=""
-  download_song "$sid" "${nm:-$sid}" "${ar:-unknown}" "$al" "$pic"
+  local drc=0
+  download_song "$sid" "${nm:-$sid}" "${ar:-unknown}" "$al" "$pic"; drc=$?
+  # 用户主动跳过同名文件不算失败, 正常返回 0
+  if [ "$drc" = 3 ]; then
+    info "已跳过同名文件, 未下载"
+    return 0
+  fi
+  return "$drc"
 }
 
 # ---------------- 设置 ----------------
@@ -1147,6 +1244,175 @@ install_shortcut() {
   fi
 }
 
+# ---------------- 检查更新 / 更新脚本 ----------------
+# 更新源 UPDATE_URL 见脚本头部, 可用 CHKSZ_RAW_URL 环境变量覆盖。
+# 不做启动时自动检查: 只在用户显式运行 check-update / update (或菜单 10) 时联网,
+# 日常命令不因检查更新变慢或失败。
+
+extract_version() {
+  # $1=脚本文件 -> 输出其中的 VERSION 值, 找不到则为空
+  sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -n 1
+}
+
+version_newer() {
+  # $1 是否比 $2 新 (x.y.z 逐段数字比较), 是返回 0
+  local -a a=() b=()
+  local i av bv
+  IFS=. read -ra a <<< "$1"
+  IFS=. read -ra b <<< "$2"
+  for ((i = 0; i < ${#a[@]} || i < ${#b[@]}; i++)); do
+    av="${a[i]:-0}"; bv="${b[i]:-0}"
+    av="${av//[^0-9]/}"; bv="${bv//[^0-9]/}"
+    [ -z "$av" ] && av=0
+    [ -z "$bv" ] && bv=0
+    if ((10#$av > 10#$bv)); then return 0; fi
+    if ((10#$av < 10#$bv)); then return 1; fi
+  done
+  return 1
+}
+
+# check_update : 结果写全局 REMOTE_VERSION / UPDATE_AVAILABLE；
+# 检查本身成功返回 0, 拉取/解析失败返回 1。
+REMOTE_VERSION=""
+UPDATE_AVAILABLE=0
+check_update() {
+  REMOTE_VERSION=""
+  UPDATE_AVAILABLE=0
+  info "检查更新 (源: $UPDATE_URL)"
+  local tmp=""
+  tmp="$(mktemp)" || return 1
+  if ! curl -fsSL --max-time 30 "$UPDATE_URL" -o "$tmp"; then
+    rm -f "$tmp"
+    err "无法获取远程脚本, 请检查网络或更新源地址"
+    return 1
+  fi
+  REMOTE_VERSION="$(extract_version "$tmp")"
+  rm -f "$tmp"
+  if [ -z "$REMOTE_VERSION" ]; then
+    err "远程脚本中未找到版本号, 无法判断更新"
+    return 1
+  fi
+  printf "当前版本: v%s\n最新版本: v%s\n" "$VERSION" "$REMOTE_VERSION"
+  if version_newer "$REMOTE_VERSION" "$VERSION"; then
+    UPDATE_AVAILABLE=1
+    ok "有新版本可用: v$VERSION -> v$REMOTE_VERSION, 运行 chksz update 更新"
+  elif [ "$REMOTE_VERSION" = "$VERSION" ]; then
+    ok "已是最新版本"
+  else
+    info "本地版本高于远程发布版本, 无需更新 (本地可能是未发布版本)"
+  fi
+  return 0
+}
+
+# update_self [--force]
+# 安全顺序: 下载到同目录临时文件 -> 校验 (非空/shebang/版本号/bash -n) ->
+# 版本比较 (默认不降级、不重装同版本, --force 才允许) -> 备份旧版到
+# $SELF.bak -> chmod +x 后 mv 原子替换 -> 跑新版 version 复核, 失败自动回滚。
+# 用 mv 换新文件 (新 inode) 而不是覆盖写: 正在运行的旧进程仍持有旧
+# inode, 不会读到写一半的脚本；新版本从下次运行 chksz 起生效。
+UPDATE_PERFORMED=0
+update_self() {
+  UPDATE_PERFORMED=0
+  local force=0
+  case "${1:-}" in
+    "" ) ;;
+    --force|-f) force=1 ;;
+    *) err "未知选项: $1 (用法: chksz update [--force])"; return 1 ;;
+  esac
+  if [ ! -f "$SELF" ]; then
+    err "当前不是以文件方式运行 chksz, 无法自更新"
+    err "请先用一键安装装好脚本, 再运行 chksz update"
+    return 1
+  fi
+  local dir=""
+  dir="$(dirname "$SELF")"
+  if [ ! -w "$SELF" ] || [ ! -w "$dir" ]; then
+    err "当前脚本不可写: $SELF"
+    err "可以用一键安装命令更新: curl -fsSL https://raw.githubusercontent.com/wang4386/chksz-cli/main/install.sh | bash"
+    return 1
+  fi
+  info "下载最新脚本 (源: $UPDATE_URL)"
+  local tmp=""
+  tmp="$(mktemp "$dir/.chksz-update.XXXXXX")" || { err "无法在 $dir 创建临时文件"; return 1; }
+  if ! curl -fsSL --max-time 60 "$UPDATE_URL" -o "$tmp"; then
+    rm -f "$tmp"
+    err "下载失败, 未更新 (网络或更新源问题)"
+    return 1
+  fi
+  # --- 校验远程内容, 任一项不过都放弃, 当前脚本原样不动 ---
+  if [ ! -s "$tmp" ]; then
+    rm -f "$tmp"; err "远程脚本为空, 已放弃更新"; return 1
+  fi
+  if ! head -n 1 "$tmp" | grep -q '^#!.*bash'; then
+    rm -f "$tmp"; err "远程内容不像是 bash 脚本, 已放弃更新"; return 1
+  fi
+  local remote_ver=""
+  remote_ver="$(extract_version "$tmp")"
+  if [ -z "$remote_ver" ]; then
+    rm -f "$tmp"; err "远程脚本中未找到版本号, 已放弃更新"; return 1
+  fi
+  if ! bash -n "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; err "远程脚本语法检查未通过, 已放弃更新"; return 1
+  fi
+  # --- 版本比较 ---
+  if [ "$remote_ver" = "$VERSION" ] && [ "$force" != 1 ]; then
+    rm -f "$tmp"
+    ok "已是最新版本 v$VERSION, 无需更新 (强制重装: chksz update --force)"
+    return 0
+  fi
+  if version_newer "$VERSION" "$remote_ver" && [ "$force" != 1 ]; then
+    rm -f "$tmp"
+    warn "远程版本 v$remote_ver 低于本地 v$VERSION, 已拒绝降级 (确需降级: chksz update --force)"
+    return 0
+  fi
+  # --- 备份 + 原子替换 ---
+  if ! cp -f "$SELF" "$SELF.bak"; then
+    rm -f "$tmp"
+    err "备份旧版本失败 ($SELF.bak), 已放弃更新"
+    return 1
+  fi
+  chmod +x "$tmp"
+  if ! mv -f "$tmp" "$SELF"; then
+    rm -f "$tmp"
+    err "替换脚本失败, 旧版本未动 (备份在 $SELF.bak)"
+    return 1
+  fi
+  # --- 复核新版本, 不通过就用备份回滚 ---
+  local new_out=""
+  new_out="$("$SELF" version 2>/dev/null)"
+  if [ "$new_out" != "chksz v$remote_ver" ]; then
+    err "新版本复核失败 (期望 'chksz v$remote_ver', 实际 '$new_out'), 正在回滚"
+    if mv -f "$SELF.bak" "$SELF"; then
+      err "已回滚到旧版本 v$VERSION"
+    else
+      err "回滚也失败了! 旧版本备份在 $SELF.bak, 请手动恢复"
+    fi
+    return 1
+  fi
+  UPDATE_PERFORMED=1
+  ok "已更新: v$VERSION -> v$remote_ver"
+  info "旧版本备份在: $SELF.bak (回滚: cp $SELF.bak $SELF)"
+  info "新版本从下次运行 chksz 起生效；若在菜单中更新, 请退出后重新进入"
+  return 0
+}
+
+# 菜单里的更新: 先检查, 有新版才询问, 更新成功后提示重进菜单
+update_menu() {
+  check_update || return 0
+  if [ "$UPDATE_AVAILABLE" != 1 ]; then
+    return 0
+  fi
+  local yn=""
+  read -rp "发现新版本 v$REMOTE_VERSION, 是否现在更新? [y/N]: " yn < /dev/tty
+  if [[ "$yn" =~ ^[yY]$ ]]; then
+    if update_self && [ "$UPDATE_PERFORMED" = 1 ]; then
+      ok "更新完成, 请退出并重新运行 chksz 使用新版本"
+    fi
+  else
+    info "暂不更新, 需要时运行: chksz update"
+  fi
+}
+
 # ---------------- 卸载 ----------------
 # 安全卸载: 逐项确认, 危险操作默认否; 歌曲文件默认保留
 uninstall() {
@@ -1270,6 +1536,7 @@ main_menu() {
     echo "7) 卸载 chksz"
     echo "8) 下载记录"
     echo "9) 检测/修复歌词嵌入"
+    echo "10) 检查更新 / 更新脚本"
     echo "0) 退出"
     read -rp "请选择: " c < /dev/tty
     case "$c" in
@@ -1282,6 +1549,7 @@ main_menu() {
       7) uninstall ;;
       8) show_history "" ;;
       9) check_lyrics_cmd ;;
+      10) update_menu ;;
       0) echo "再见!"; exit 0 ;;
       *) warn "无效选择" ;;
     esac
@@ -1304,6 +1572,9 @@ chksz v$VERSION - ChKSz API 交互式音乐下载 (网易云)
   chksz deps                     安装依赖 (curl/jq/ffmpeg)
   chksz install                  安装 chksz 快捷命令到 ~/.local/bin
   chksz uninstall                安全卸载 (删脚本/配置/快捷命令, 逐项确认)
+  chksz check-update             检查更新 (对比远程最新版本, 不做任何改动)
+  chksz update [--force]         更新脚本到最新版 (自动备份旧版到 chksz.bak;
+                                 默认不降级、不重装同版本, --force 才允许)
   chksz history [N|all]          查看下载记录 (默认最近 50 条, 在 ~/.config/chksz/history.tsv)
   chksz check-lyrics [--fix] [文件]
                                  检测歌词嵌入: 无参数扫描全部下载记录, 有文件只测该文件;
@@ -1334,6 +1605,8 @@ main() {
     deps)           install_deps ;;
     install)        install_shortcut ;;
     uninstall)      uninstall ;;
+    check-update)   check_update ;;
+    update)         shift; update_self "${1:-}" ;;
     history)        shift; show_history "${1:-}" ;;
     check-lyrics)   shift; check_lyrics_cmd "$@" ;;
     fix-lyrics)     shift; fix_lyrics_cmd "$@" ;;
