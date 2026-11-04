@@ -22,7 +22,7 @@
 
 set -u
 
-VERSION="1.3.0"
+VERSION="1.3.2"
 API_BASE="https://api.chksz.com/api"
 # 更新源: 与 install.sh 的 CHKSZ_RAW_URL 同一约定, 可用环境变量覆盖 (镜像/自建源)
 UPDATE_URL="${CHKSZ_RAW_URL:-https://raw.githubusercontent.com/wang4386/chksz-cli/main/chksz}"
@@ -80,7 +80,8 @@ load_config() {
     while IFS='=' read -r k v; do
       case "$k" in
         APIKEY|SAVE_DIR|QUALITY|SAVE_LRC|EMBED_META)
-          # 去掉首尾引号
+          # 先去行尾回车 (容忍 CRLF 配置文件), 再去掉首尾引号
+          v="${v%$'\r'}"
           v="${v%\"}"; v="${v#\"}"
           printf -v "$k" '%s' "$v"
           ;;
@@ -152,6 +153,10 @@ api_code() { jq -r '.code // 0' <<<"$1" 2>/dev/null || echo 0; }
 
 check_api_resp() {
   local body="$1" action="$2"
+  if [ -z "$body" ]; then
+    err "${action}失败: 服务器无响应 (网络问题或接口不可用)"
+    return 1
+  fi
   local code
   code=$(api_code "$body")
   if [ "$code" = "401" ]; then
@@ -356,8 +361,10 @@ download_song() {
         lrc_file="${target%.*}.lrc"
         ok "  歌词已保存"
       fi
-      # 去时间轴, 留纯文本 (同 CDown 的 parse_lrc_to_uslt)
-      lrc_plain="$(sed -e 's/^\[[^]]*\] *//' <<<"$lrc" | sed '/^[[:space:]]*$/d')"
+      # 去时间轴, 留纯文本 (同 CDown 的 parse_lrc_to_uslt)。
+      # 用 + 重复剥离行首的方括号组: 多时间戳行 ([00:01][00:02]…) 只剥一层
+      # 会把第二个时间戳当歌词嵌进 USLT, 与 lrc_to_plain 的 sed 口径保持一致。
+      lrc_plain="$(sed -E 's/^(\[[^]]*\])+[[:space:]]*//' <<<"$lrc" | sed '/^[[:space:]]*$/d')"
     fi
   }
 
@@ -397,8 +404,12 @@ embed_metadata() {
   local ext="${audio##*.}" cover_tmp=""
   EMBED_STATUS="failed"
   if [ -n "$pic" ] && [ "$pic" != "null" ]; then
-    cover_tmp="$(mktemp --suffix=.jpg)"
-    curl -fsSL --max-time 20 -o "$cover_tmp" "$pic" 2>/dev/null || cover_tmp=""
+    # 用不带 --suffix 的 mktemp: busybox/Alpine/macOS 的 mktemp 不支持该选项,
+    # 会导致封面临时文件创建失败; 扩展名对 ffmpeg/mutagen 识别无影响。
+    cover_tmp="$(mktemp)"
+    if ! curl -fsSL --max-time 20 -A "Mozilla/5.0" -o "$cover_tmp" "$pic" 2>/dev/null; then
+      rm -f "$cover_tmp"; cover_tmp=""
+    fi
   fi
 
   if command -v python3 >/dev/null 2>&1 && python3 -c "import mutagen" 2>/dev/null; then
@@ -457,9 +468,11 @@ PYEOF
     warn "  mutagen 嵌入失败, 尝试 ffmpeg"
   fi
 
-  if [ -n "$cover_tmp" ]; then
-    if command -v ffmpeg >/dev/null 2>&1; then
-      local tagged="${audio}.tagged.${ext}"
+  # ffmpeg 回退: 有封面嵌封面+标签; 封面拉不到时也至少把标签写进去,
+  # 不再因为封面失败就整首放弃嵌入 (旧逻辑的 elif 分支即此缺陷)。
+  if command -v ffmpeg >/dev/null 2>&1; then
+    local tagged="${audio}.tagged.${ext}"
+    if [ -n "$cover_tmp" ]; then
       if ffmpeg -y -loglevel error -i "$audio" -i "$cover_tmp" \
            -map 0:a -map 1:v -c:a copy -c:v mjpeg \
            -disposition:v attached_pic \
@@ -474,12 +487,24 @@ PYEOF
         warn "  ffmpeg 嵌入失败"
       fi
     else
-      EMBED_STATUS="failed"
-      warn "  未安装 ffmpeg/mutagen, 跳过元数据嵌入 (菜单 5 可安装)"
+      if [ -n "$pic" ] && [ "$pic" != "null" ]; then
+        warn "  封面下载失败, 仅嵌入标签"
+      fi
+      if ffmpeg -y -loglevel error -i "$audio" -c:a copy \
+           -metadata title="$title" -metadata artist="$artist" \
+           -metadata album="$album" "$tagged" 2>/dev/null; then
+        mv -f "$tagged" "$audio"
+        EMBED_STATUS="partial"
+        ok "  标签已嵌入 (ffmpeg; 歌词未入标准帧, 建议安装 mutagen)"
+      else
+        rm -f "$tagged"
+        EMBED_STATUS="failed"
+        warn "  ffmpeg 嵌入失败"
+      fi
     fi
-  elif [ -z "$cover_tmp" ] && [ -n "$lyrics" ]; then
+  else
     EMBED_STATUS="failed"
-    warn "  无封面且无嵌入工具, 跳过元数据嵌入"
+    warn "  未安装 ffmpeg/mutagen, 跳过元数据嵌入 (运行 chksz deps 安装)"
   fi
   rm -f "$cover_tmp"
   return 0
@@ -1490,12 +1515,28 @@ uninstall() {
     local yn3
     read -rp "是否保留已下载的歌曲文件? ($SAVE_DIR) [Y/n]: " yn3 < /dev/tty
     if [[ "$yn3" =~ ^[nN]$ ]]; then
-      case "$SAVE_DIR" in
-        ""|"/"|"$HOME")
-          err "拒绝删除关键目录 ($SAVE_DIR), 请手动处理" ;;
-        *)
-          rm -rf "$SAVE_DIR" && ok "已删除歌曲文件" ;;
+      # 删除前先规范化再做危险目录校验: 去首尾空白与尾部斜杠后,
+      # 拒绝空路径、根目录、主目录、相对路径与一级绝对路径 (如 /root、/etc),
+      # 防止配置被写坏 (如 "$HOME/"、" ") 时误删关键目录。
+      local save_norm="$SAVE_DIR"
+      save_norm="$(printf '%s' "$save_norm" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+      while [ "${#save_norm}" -gt 1 ]; do
+        case "$save_norm" in
+          */) save_norm="${save_norm%/}" ;;
+          *) break ;;
+        esac
+      done
+      local danger=0
+      case "$save_norm" in
+        ""|"/"|"$HOME"|"."|"..") danger=1 ;;
+        /*/*) : ;;
+        *) danger=1 ;;
       esac
+      if [ "$danger" = 1 ]; then
+        err "拒绝删除危险目录 ($SAVE_DIR), 请手动处理"
+      else
+        rm -rf "$save_norm" && ok "已删除歌曲文件"
+      fi
     else
       ok "已保留歌曲文件: $SAVE_DIR"
     fi

@@ -2,7 +2,9 @@
 
 - 这是 `chksz` 项目的 agent 操作手册。`chksz` 是一个纯 Bash 交互式音乐下载脚本，基于 ChKSz API 下载网易云音乐，由 [ChKSz/CDown](https://github.com/ChKSz/CDown)（PyQt6 GUI 版）重构而来，专为 SSH 终端和服务器环境设计。
 
-- 仓库地址是 `https://github.com/wang4386/chksz-cli`。三个文件：`chksz`（主脚本，可执行）、`install.sh`（一键安装）、`README.md`（用户文档）。本文件是给 agent 看的操作指南。
+- 仓库地址是 `https://github.com/wang4386/chksz-cli`。五个文件：`chksz`（主脚本，可执行）、`install.sh`（一键安装）、`README.md`（用户文档）、本文件（操作指南）、`MAINTENANCE.md`（长期维护文档）。
+
+- 修改代码、排查疑难或接手继续开发前，先读 `MAINTENANCE.md`。里面有代码地图、不可破坏的契约（配置格式、history.tsv 列序、EMBED_STATUS 取值等）、已知陷阱和发布流程。
 
 ## 安装
 
