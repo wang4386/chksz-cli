@@ -76,6 +76,8 @@ printf 'all\n' | script -qec "chksz playlist 5202687076" /dev/null
 
 - 检查更新/自更新（v1.3.0）：更新源是 GitHub 仓库的 `chksz` 原文件，
   环境变量 `CHKSZ_RAW_URL` 可覆盖（与 install.sh 同一约定）。
+  直连失败时自动经加速源重试（默认 `https://gh.qninq.cn`，v1.3.4 起；
+  `CHKSZ_GH_PROXY` 可覆盖、设空禁用；install.sh 同逻辑）。
   `chksz update` 非交互运行时不询问、直接更新——命令本身即确认，
   所以 agent 代跑前必须先向用户说明并得到同意，不要自行升级用户机器上的脚本。
   更新会先下载到同目录临时文件并校验（非空/bash shebang/有版本号/`bash -n` 通过），

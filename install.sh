@@ -9,13 +9,25 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CHKSZ_RAW_URL="${CHKSZ_RAW_URL:-https://raw.githubusercontent.com/wang4386/chksz-cli/main/chksz}"
+# GitHub 加速源: 直连下载失败时经此代理重试 (与 chksz 的 GH_PROXY 同一约定)。
+# 可用环境变量 CHKSZ_GH_PROXY 覆盖, 设为空字符串则禁用加速回退。
+CHKSZ_GH_PROXY="${CHKSZ_GH_PROXY-https://gh.qninq.cn}"
 SRC_FILE=""
 if [ -f "$SCRIPT_DIR/chksz" ]; then
   SRC_FILE="$SCRIPT_DIR/chksz"
 else
   echo "[*] 从远程下载 chksz ..."
   tmp="$(mktemp)"
-  curl -fsSL "$CHKSZ_RAW_URL" -o "$tmp"
+  if ! curl -fsSL "$CHKSZ_RAW_URL" -o "$tmp"; then
+    if [ -n "$CHKSZ_GH_PROXY" ] && \
+       curl -fsSL "${CHKSZ_GH_PROXY%/}/$CHKSZ_RAW_URL" -o "$tmp"; then
+      echo "[*] 直连失败, 已通过加速源 $CHKSZ_GH_PROXY 下载"
+    else
+      echo "[✗] 下载失败 (直连与加速源均不可达): $CHKSZ_RAW_URL"
+      rm -f "$tmp"
+      exit 1
+    fi
+  fi
   SRC_FILE="$tmp"
 fi
 

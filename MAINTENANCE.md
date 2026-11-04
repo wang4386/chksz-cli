@@ -12,7 +12,7 @@
 
 ## 2. 版本现状（接手必读）
 
-- 本地主本与 GitHub `wang4386/chksz-cli` 的 `main` 均为 **1.3.2**（2026-11-04 同步，commit `3ca9fab`；此前 GitHub 曾长期停在 1.0.0，1.1–1.3.2 已一次性补推）。
+- 本地主本与 GitHub `wang4386/chksz-cli` 的 `main` 均为 **1.3.4**（2026-11-04 同步；1.3.2 commit `3ca9fab`，1.3.3 commit `384f6df`）。
 - 后续推送与否仍由用户决定，不要默认已推送。推送方式见第 9 节。
 - 脚本内置自更新（`chksz update`）拉的是 GitHub `main` 上的 `chksz` 原始文件，用户端现可自更新到 1.3.2。
 
@@ -65,7 +65,7 @@
 - 所有交互输入一律从 `/dev/tty` 读，不读 stdin。这样管道喂数据不会误触发交互；agent 自动化时需用 `script -qec` 提供伪终端。
 - 下载先落 `.downloading` 临时文件，`curl -C -` 断点续传，成功后 `mv` 成正式文件，不要改成直写目标文件。
 - 文件名规则：`歌手 - 歌名.扩展名`，`sanitize` 把 `/\:*?"<>|` 换成 `_` 并截断 100 字符；扩展名由实际音质决定（jymaster/hires/lossless → flac，exhigh/standard → mp3），不要按请求音质写死。
-- 更新源约定：`chksz` 的 `UPDATE_URL` 与 `install.sh` 的默认值都取环境变量 `CHKSZ_RAW_URL`，缺省指向 GitHub 仓库 raw 地址，改一处必须同步另一处。
+- 更新源约定：`chksz` 的 `UPDATE_URL` 与 `install.sh` 的默认值都取环境变量 `CHKSZ_RAW_URL`，缺省指向 GitHub 仓库 raw 地址，改一处必须同步另一处。下载统一走回退逻辑（chksz 内为 `fetch_update_script`，install.sh 内联同逻辑）：直连失败时经加速源 `GH_PROXY`（默认 `https://gh.qninq.cn`，环境变量 `CHKSZ_GH_PROXY` 覆盖、设空禁用）以「代理前缀 + 原始 URL」重试一次；改回退逻辑时两处仍须同步。
 
 ## 5. API 事实（https://api.chksz.com）
 
@@ -130,4 +130,5 @@
 | 1.3.0 | 2026-10 下旬 | `check-update` / `update` 自更新（校验远程脚本后安全替换）。2026-11-04 已推送 |
 | 1.3.1 | 2026-11-04 | 修复 ffmpeg 路径封面失败连坐放弃嵌入；封面 mktemp 去 `--suffix` 兼容 busybox/macOS。2026-11-04 已推送 |
 | 1.3.2 | 2026-11-04 | 全量审核修复四处：卸载删歌目录先规范化路径再校验（拒 `HOME/` 尾斜杠、相对路径、一级绝对路径）；下载歌词剥时间戳改为重复剥离（多时间戳行不残留）；配置读取容忍 CRLF；API 空响应给明确提示。审核记录在 QA 副本 REVIEW.md。2026-11-04 已推送 |
-| 1.3.3 | 未发布 | 封面按文件签名识别 MIME、拒绝无效图片响应且不误报嵌入；下载/修复共用 LRC 清理（含增强时间戳）；ffmpeg 回退写入歌词并区分 MP3 非标准 TXXX 与 FLAC LYRICS 状态。仅本地工作区修改，未推送 |
+| 1.3.3 | 2026-11-04 | 封面按文件签名识别 MIME、拒绝无效图片响应且不误报嵌入；下载/修复共用 LRC 清理（含增强时间戳）；ffmpeg 回退写入歌词并区分 MP3 非标准 TXXX 与 FLAC LYRICS 状态。已推送 (commit 384f6df) |
+| 1.3.4 | 2026-11-04 | 更新下载增加 GitHub 加速源回退：直连 raw 失败时自动经 gh.qninq.cn 代理重试 (chksz 的 check-update/update 与 install.sh 同步)，可用 CHKSZ_GH_PROXY 覆盖、设空禁用。已推送 |

@@ -22,10 +22,14 @@
 
 set -u
 
-VERSION="1.3.3"
+VERSION="1.3.4"
 API_BASE="https://api.chksz.com/api"
 # 更新源: 与 install.sh 的 CHKSZ_RAW_URL 同一约定, 可用环境变量覆盖 (镜像/自建源)
 UPDATE_URL="${CHKSZ_RAW_URL:-https://raw.githubusercontent.com/wang4386/chksz-cli/main/chksz}"
+# GitHub 加速源: 直连更新源失败时自动经此代理重试 (代理前缀 + 原始 URL)。
+# 国内网络直连 GitHub 常受阻, 故内置回退; 可用环境变量 CHKSZ_GH_PROXY
+# 覆盖为自建代理, 设为空字符串则禁用加速回退。
+GH_PROXY="${CHKSZ_GH_PROXY-https://gh.qninq.cn}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/chksz"
 CONFIG_FILE="$CONFIG_DIR/config"
 HISTORY_FILE="$CONFIG_DIR/history.tsv"
@@ -1358,17 +1362,45 @@ version_newer() {
 # 检查本身成功返回 0, 拉取/解析失败返回 1。
 REMOTE_VERSION=""
 UPDATE_AVAILABLE=0
+# fetch_update_script <目标文件> <超时秒数>
+# 下载远程脚本: 先直连 UPDATE_URL, 失败时经 GH_PROXY 加速源重试一次。
+# 成功返回 0, FETCH_SOURCE 记录实际走的通道 (直连/加速源)。
+FETCH_SOURCE=""
+fetch_update_script() {
+  local out="$1" max_time="${2:-30}"
+  FETCH_SOURCE="直连"
+  if curl -fsSL --max-time "$max_time" "$UPDATE_URL" -o "$out" 2>/dev/null; then
+    return 0
+  fi
+  # 仅对 http(s) 且尚未带代理前缀的地址走加速回退
+  case "$UPDATE_URL" in
+    http://*|https://*) ;;
+    *) return 1 ;;
+  esac
+  if [ -n "$GH_PROXY" ]; then
+    case "$UPDATE_URL" in
+      "${GH_PROXY%/}/"*) return 1 ;;
+    esac
+    if curl -fsSL --max-time "$max_time" "${GH_PROXY%/}/$UPDATE_URL" -o "$out" 2>/dev/null; then
+      FETCH_SOURCE="加速源 ($GH_PROXY)"
+      return 0
+    fi
+  fi
+  return 1
+}
+
 check_update() {
   REMOTE_VERSION=""
   UPDATE_AVAILABLE=0
   info "检查更新 (源: $UPDATE_URL)"
   local tmp=""
   tmp="$(mktemp)" || return 1
-  if ! curl -fsSL --max-time 30 "$UPDATE_URL" -o "$tmp"; then
+  if ! fetch_update_script "$tmp" 30; then
     rm -f "$tmp"
-    err "无法获取远程脚本, 请检查网络或更新源地址"
+    err "无法获取远程脚本, 请检查网络或更新源地址 (直连与加速源均失败)"
     return 1
   fi
+  [ "$FETCH_SOURCE" != "直连" ] && info "直连失败, 已通过 $FETCH_SOURCE 获取"
   REMOTE_VERSION="$(extract_version "$tmp")"
   rm -f "$tmp"
   if [ -z "$REMOTE_VERSION" ]; then
@@ -1417,11 +1449,12 @@ update_self() {
   info "下载最新脚本 (源: $UPDATE_URL)"
   local tmp=""
   tmp="$(mktemp "$dir/.chksz-update.XXXXXX")" || { err "无法在 $dir 创建临时文件"; return 1; }
-  if ! curl -fsSL --max-time 60 "$UPDATE_URL" -o "$tmp"; then
+  if ! fetch_update_script "$tmp" 60; then
     rm -f "$tmp"
-    err "下载失败, 未更新 (网络或更新源问题)"
+    err "下载失败, 未更新 (直连与加速源均不可达)"
     return 1
   fi
+  [ "$FETCH_SOURCE" != "直连" ] && info "直连失败, 已通过 $FETCH_SOURCE 下载"
   # --- 校验远程内容, 任一项不过都放弃, 当前脚本原样不动 ---
   if [ ! -s "$tmp" ]; then
     rm -f "$tmp"; err "远程脚本为空, 已放弃更新"; return 1
