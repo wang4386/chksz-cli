@@ -95,8 +95,11 @@
 
 ## 8. 已知问题与陷阱
 
-- 用户机器缺 mutagen/ffmpeg 时，下载只打印一行「跳过元数据嵌入」警告，容易被误认为脚本坏了。2026-11-04 用户反馈「封面和歌词都没嵌入」即属此类（本地四种路径复测均正常）。排查第一步永远是 `chksz deps` 看工具状态。
-- `chksz deps` 里 ffmpeg 与 mutagen 都是 opt-in 询问，小磁盘机器常被跳过，之后又来问为什么没嵌入。沟通时先确认这两项。
+- 用户机器缺 mutagen/ffmpeg 时，下载会提示跳过元数据嵌入；排查第一步用 `chksz deps` 检查工具状态。
+- `chksz deps` 里 ffmpeg 与 mutagen 都是 opt-in 询问，小磁盘机器常被跳过；沟通时先确认这两项。
+- 封面 MIME 必须由图片字节签名识别，不得从 URL 后缀推断或固定写成 JPEG；无效/HTML 响应须跳过封面并继续写标签/歌词。
+- 下载和 fix-lyrics 必须共用 `lrc_text_to_plain`，覆盖重复时间戳、增强 LRC 行内时间标记以及与时间戳相邻的 LRC 元数据。
+- ffmpeg 回退结果：MP3 歌词是非标准 TXXX:USLT（partial）；FLAC `lyrics` Vorbis Comment 可被 Mutagen 检出为标准字段。提示与 history 状态应保持一致。
 - 歌单接口对超大歌单一次返回全部 tracks，没有分页处理；上千首的歌单会慢且吃内存，目前接受此限制。
 - `do_song` 按 ID 直下时拿不到歌名/歌手信息，文件名退化为歌曲 ID，这是接口限制（歌词接口不返回元信息），不是 bug。
 - 卸载只清理本脚本写过的东西：`~/.local/bin/chksz`、配置目录、`.bashrc` 里带 `# chksz 快捷命令` 注释的那组 PATH 行。用户自己写的同名 PATH 行不在清理范围，实现上靠注释行锚定，不要改成按 export 行全文匹配删除。
@@ -114,7 +117,7 @@
 - 语法门：`bash -n chksz`，有 shellcheck 时再跑一遍。
 - 无真实 Key 的端到端测试法（本维护环境专用）：复制脚本为测试副本，把副本里 `api_get` 的 curl 行替换为调用 `~/workspace/custom-connectors/custom.chksz/bin/chksz_api.py "$endpoint" "$@"`，再用测试用 `XDG_CONFIG_HOME` 跑流程；交互步骤用 `printf '1\n' | script -qec "..." /dev/null` 喂输入。
 - 嵌入验证：下载后用 `python3 -c` + mutagen 读帧（数 USLT/APIC 个数），或 `ffprobe` 看 mjpeg 流与 format_tags。只看脚本输出的「已嵌入」字样不算验证通过。
-- 嵌入四情形回归清单：mutagen+正常封面、mutagen+封面 404、ffmpeg+正常封面、ffmpeg+封面 404，四种都要过。
+- 嵌入回归至少覆盖：Mutagen MP3/FLAC + PNG/JPEG、Mutagen + 无效图片响应、ffmpeg MP3 TXXX 与 FLAC LYRICS、ffmpeg 封面写入失败回退、普通/重复/增强 LRC 清理。测试需检查实际帧/字段，不只看日志。
 - 卸载测试必须在沙盒 HOME 里做（`HOME=/tmp/fakehomeN`），不要在真实 HOME 里试。
 
 ## 11. 变更日志
@@ -127,3 +130,4 @@
 | 1.3.0 | 2026-10 下旬 | `check-update` / `update` 自更新（校验远程脚本后安全替换）。2026-11-04 已推送 |
 | 1.3.1 | 2026-11-04 | 修复 ffmpeg 路径封面失败连坐放弃嵌入；封面 mktemp 去 `--suffix` 兼容 busybox/macOS。2026-11-04 已推送 |
 | 1.3.2 | 2026-11-04 | 全量审核修复四处：卸载删歌目录先规范化路径再校验（拒 `HOME/` 尾斜杠、相对路径、一级绝对路径）；下载歌词剥时间戳改为重复剥离（多时间戳行不残留）；配置读取容忍 CRLF；API 空响应给明确提示。审核记录在 QA 副本 REVIEW.md。2026-11-04 已推送 |
+| 1.3.3 | 未发布 | 封面按文件签名识别 MIME、拒绝无效图片响应且不误报嵌入；下载/修复共用 LRC 清理（含增强时间戳）；ffmpeg 回退写入歌词并区分 MP3 非标准 TXXX 与 FLAC LYRICS 状态。仅本地工作区修改，未推送 |

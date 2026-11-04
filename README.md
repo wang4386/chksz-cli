@@ -72,9 +72,7 @@ chksz update --force   # 强制重装同版本, 或降级到远程版本
 | 封面 | APIC 内嵌 | PICTURE 内嵌 |
 | 歌词(去时间轴纯文本) | 标准 **USLT** 帧 | **LYRICS** 字段 |
 
-实现优先级: `python3 + mutagen` (标准帧) > `ffmpeg` (封面+标签; 歌词只能进 TXXX，
-部分播放器不识别) > 跳过。`chksz deps` 可一键安装 mutagen。
-歌词原文 `.lrc` 文件也会一并保存 (可用设置关闭)。
+实现优先级: `python3 + mutagen` (标准歌词帧) > `ffmpeg` (封面+标签；MP3 歌词写入非标准 TXXX，部分播放器不识别；FLAC 写入 LYRICS 字段) > 跳过。`chksz deps` 可一键安装 mutagen。封面按实际文件签名识别 JPEG/PNG/GIF/WebP/BMP，错误页或损坏响应会跳过封面并继续写入其他元数据。歌词原文 `.lrc` 文件也会一并保存 (可用设置关闭)。
 
 ## 下载记录与歌词检测/修复 (v1.1.0)
 
@@ -83,7 +81,7 @@ chksz update --force   # 强制重装同版本, 或降级到远程版本
   （`ok` / `partial` / `failed` / `no-lyric` / `skipped`）。历史是日志，修复后不会改写，
   当前状态以检测实测为准。
 - 检测标准：MP3 看标准 USLT 帧（非空才算成功），FLAC 看 LYRICS 字段。
-  旧版 ffmpeg 遗留的 TXXX 歌词不算成功，只算“非标准帧”，修复时会换成标准帧。
+  ffmpeg 回退生成的 TXXX 歌词算“非标准帧”，修复时会换成标准帧。
 - 修复只动歌词：MP3 删旧 USLT/歌词类 TXXX 后加 USLT，FLAC 只写 LYRICS，
   封面、标题/歌手/专辑等其他标签原样保留。
 - 歌词来源优先级：同名 `.lrc`（离线最可靠）> 按下载记录/ `--id` 给出的歌曲 ID

@@ -90,13 +90,13 @@ printf 'all\n' | script -qec "chksz playlist 5202687076" /dev/null
   且 `history.tsv` 中该路径的旧记录会被新记录替换；副本走新路径，记录另加一条。
   跳过时 `download_song` 返回 3，搜索/歌单统计单列跳过数，`chksz song` 跳过后正常返回 0。
 
-- 开启 `EMBED_META` 时自动嵌入元数据，播放器无需联网刮削。优先 `python3 + mutagen`：MP3 写入标准 USLT 歌词帧（去时间轴纯文本）、APIC 封面、TIT2/TPE1/TALB 标签；FLAC 写入 LYRICS 字段、内嵌封面、Vorbis 标签。没有 mutagen 时回退到 `ffmpeg`（封面加基础标签，歌词只能进 TXXX）。
+- 开启 `EMBED_META` 时自动嵌入元数据，播放器无需联网刮削。优先 `python3 + mutagen`：MP3 写入标准 USLT 歌词帧（清理普通/重复/增强 LRC 时间标记）、APIC 封面、TIT2/TPE1/TALB 标签；FLAC 写入 LYRICS 字段、内嵌封面、Vorbis 标签。封面按文件签名识别 MIME，并跳过无效图片响应而继续处理其他标签。没有 mutagen 时回退到 `ffmpeg`：MP3 歌词写入非标准 TXXX（状态为 partial，部分播放器不识别），FLAC 写入 LYRICS 字段；并写入封面和基础标签。
 
 - 歌词原文同时保存为同名的 `.lrc` 文件（`SAVE_LRC=0` 可关闭）。
 
 - 歌词检测/修复（v1.1.0，需 `python3 + mutagen`，`chksz deps` 可装）：
   检测标准是 MP3 的标准 USLT 帧（非空才算）、FLAC 的 LYRICS 字段；
-  旧版 ffmpeg 遗留的 TXXX 歌词只算 partial，不算成功。
+  ffmpeg 回退生成的 TXXX 歌词只算 partial，不算标准歌词帧。
   修复只动歌词（MP3 删旧 USLT/歌词类 TXXX 后加 USLT，FLAC 只写 LYRICS），
   封面和标题/歌手/专辑原样保留。
   歌词来源优先级：同名 `.lrc` > 按记录/`--id` 的歌曲 ID 走 API 取歌词；
